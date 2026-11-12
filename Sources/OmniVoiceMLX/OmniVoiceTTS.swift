@@ -154,7 +154,10 @@ public final class OmniVoiceTTS {
     /// `tokenizer.json`, `tokenizer_config.json`, `audio_tokenizer/model.safetensors`).
     /// A `quantization` block in `config.json` selects the quantized backbone.
     /// - Parameter computeDType: dtype for backbone float parameters/activations.
-    public init(directory: URL, computeDType: DType = .float32) async throws {
+    ///   `.float16` (default) is ~1.5x faster than `.float32` on M5 and closer to
+    ///   the PyTorch fp32 logits than `.float32` with MLX's default TF32 matmuls;
+    ///   use `.float32` with `MLX_ENABLE_TF32=0` for token-exact parity.
+    public init(directory: URL, computeDType: DType = .float16) async throws {
         let fm = FileManager.default
         for f in OmniVoiceBundle.requiredFiles
         where !fm.fileExists(atPath: directory.appendingPathComponent(f).path) {
@@ -190,7 +193,7 @@ public final class OmniVoiceTTS {
         _ bundle: OmniVoiceBundle = .int8,
         cacheRoot: URL = OmniVoiceBundle.defaultCacheRoot,
         offline: Bool = false,
-        computeDType: DType = .float32
+        computeDType: DType = .float16
     ) async throws -> OmniVoiceTTS {
         let dir = try await resolveBundle(bundle, cacheRoot: cacheRoot, offline: offline)
         return try await OmniVoiceTTS(directory: dir, computeDType: computeDType)

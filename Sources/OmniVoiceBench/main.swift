@@ -17,7 +17,7 @@ let usage = """
     Common options:
       --no-tf32                  exact fp32 matmuls (sets MLX_ENABLE_TF32=0; parity mode)
       --bundle int8|fp16|<dir>   model bundle (default int8)
-      --dtype f32|f16|bf16       backbone compute dtype (default f32)
+      --dtype f32|f16|bf16       backbone compute dtype (default f16)
       --cache-limit-mb N         MLX buffer-cache limit (default 1024; -1 = MLX default)
       --ref PATH                 reference audio (default /tmp/omnivoice/ref_plus_zh.wav)
       --ref-text TEXT | --ref-text-file PATH   (default: ref2.txt + " 好，我看一下。")
@@ -37,7 +37,7 @@ let usage = """
 func loadModel(_ a: inout Args, defaultBundle: String = "int8") async throws -> OmniVoiceTTS {
     let bundle = try a.string("bundle", defaultBundle)
     let dtype: DType
-    switch try a.string("dtype", "f32") {
+    switch try a.string("dtype", "f16") {
     case "f32": dtype = .float32
     case "f16": dtype = .float16
     case "bf16": dtype = .bfloat16
