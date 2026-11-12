@@ -129,7 +129,12 @@ public final class Qwen3Voice: @unchecked Sendable {
         languageIds = cfg.languages
         tokenizer = try TextTokenizer(directory: modelDirectory)
 
-        let weights = try BundleResolver.loadWeights(modelDirectory, dtype: options.computeDType)
+        // Quantizing at load must start from bf16 so scales/biases come out bf16, which
+        // is how the aufklarer / voice-train 8-bit bundles are made (`mx.quantize` on the
+        // bf16 tensors); other float dtypes are cast after quantization.
+        let quantizeOnLoad = cfg.storedBits == 0 && options.precision == .int8
+        let weights = try BundleResolver.loadWeights(
+            modelDirectory, dtype: quantizeOnLoad ? .bfloat16 : options.computeDType)
         let talker = TalkerModel(config: tc)
         let codePredictor = CodePredictorModel(config: cc)
         try applyStrict([("talker", talker), ("talker.code_predictor", codePredictor)]) {
@@ -147,7 +152,7 @@ public final class Qwen3Voice: @unchecked Sendable {
         } else {
             speakerEncoder = nil
         }
-        if cfg.storedBits == 0 && options.precision == .int8 {
+        if quantizeOnLoad {
             // Same quantized set as the aufklarer 8-bit bundles: every Linear of the
             // talker and code predictor (incl. text projection, codec head, lm heads);
             // embeddings and norms stay float.
@@ -155,6 +160,14 @@ public final class Qwen3Voice: @unchecked Sendable {
             let filter: (String, Module) -> Bool = { _, m in m is Linear && !(m is QuantizedLinear) }
             quantize(model: talker, groupSize: gs, bits: 8, filter: filter)
             quantize(model: codePredictor, groupSize: gs, bits: 8, filter: filter)
+            if options.computeDType != .bfloat16 {
+                for m in [talker, codePredictor, speakerEncoder].compactMap({ $0 as Module? }) {
+                    let cast = m.parameters().flattened().map { (k, v) in
+                        (k, v.dtype.isFloatingPoint ? v.asType(options.computeDType) : v)
+                    }
+                    m.update(parameters: ModuleParameters.unflattened(cast))
+                }
+            }
         }
 
         // The codec stays float32 regardless of computeDType.
