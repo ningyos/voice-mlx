@@ -40,6 +40,11 @@ final class TokenizerTests: XCTestCase {
         let cases: [(String, [Int])] = [
             ("<|im_start|>assistant\nHello, world!<|im_end|>\n",
              [151644, 77091, 198, 9707, 11, 1879, 0, 151645, 198]),
+            ("I'm 9mm   ok\n\n  x", [40, 2776, 220, 24, 3821, 256, 5394, 271, 220, 856]),
+            ("這個 bug 你昨天也遇過，記得嗎？",
+             [104446, 9876, 220, 56568, 104373, 74763, 99688, 99751, 3837, 113983, 105793, 11319]),
+            ("Café naïve — “quotes” 123456",
+             [34, 2577, 963, 94880, 586, 1959, 1036, 53282, 854, 220, 16, 17, 18, 19, 20, 21]),
         ]
         for (text, ids) in cases {
             XCTAssertEqual(try tok.encode(text), ids, text)

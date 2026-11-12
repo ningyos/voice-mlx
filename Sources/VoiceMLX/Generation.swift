@@ -233,7 +233,6 @@ extension Qwen3Voice {
         var frames = 0
         var finished = false
         var emittedFrames = 0
-        var chunkIndex = 0
 
         func split3() -> (MLXArray, MLXArray) {
             let ks = MLXRandom.split(key: key, into: 3)
@@ -250,6 +249,11 @@ extension Qwen3Voice {
 
         func emit(upTo end: Int, final: Bool) throws {
             guard let onChunk, let streaming else { return }
+            if end == emittedFrames {
+                // Nothing new (all frames already streamed): close with an empty final chunk.
+                try onChunk(AudioChunk(samples: [], frames: end ..< end, isFinal: final, elapsed: now() - start))
+                return
+            }
             let t0 = now()
             syncCodes(upTo: end)
             let startF = emittedFrames
@@ -266,7 +270,6 @@ extension Qwen3Voice {
             let samples = kept.asArray(Float.self)
             timings.decode += now() - t0
             emittedFrames = end
-            chunkIndex += 1
             try onChunk(AudioChunk(samples: samples, frames: startF ..< end, isFinal: final, elapsed: now() - start))
         }
 
@@ -326,9 +329,8 @@ extension Qwen3Voice {
         syncCodes(upTo: frames)
         if !profile { timings.talker = now() - tStep }
 
-        if let streaming, onChunk != nil {
-            _ = streaming
-            if frames > emittedFrames || chunkIndex == 0 { try emit(upTo: frames, final: true) }
+        if streaming != nil, onChunk != nil {
+            try emit(upTo: frames, final: true)
             timings.total = now() - start
             return Synthesis(samples: [], codes: codes, frames: frames, seed: seed, finished: finished, timings: timings)
         }
