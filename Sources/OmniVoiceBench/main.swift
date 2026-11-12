@@ -18,7 +18,7 @@ let usage = """
       --no-tf32                  exact fp32 matmuls (sets MLX_ENABLE_TF32=0; parity mode)
       --bundle int8|fp16|<dir>   model bundle (default int8)
       --dtype f32|f16|bf16       backbone compute dtype (default f16)
-      --cache-limit-mb N         MLX buffer-cache limit (default 1024; -1 = MLX default)
+      --cache-limit-mb N         MLX buffer-cache limit (default 256; -1 = MLX default = unlimited)
       --ref PATH                 reference audio (default /tmp/omnivoice/ref_plus_zh.wav)
       --ref-text TEXT | --ref-text-file PATH   (default: ref2.txt + " 好，我看一下。")
       --ref-max-seconds S        keep only the first S seconds of the reference
@@ -43,7 +43,7 @@ func loadModel(_ a: inout Args, defaultBundle: String = "int8") async throws -> 
     case "bf16": dtype = .bfloat16
     case let x: throw BenchError.usage("--dtype \(x)")
     }
-    setCacheLimit(mb: try a.int("cache-limit-mb", 1024))
+    setCacheLimit(mb: try a.int("cache-limit-mb", 256))
     let t0 = now()
     let tts: OmniVoiceTTS
     switch bundle {
