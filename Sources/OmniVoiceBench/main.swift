@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import OmniVoiceAudio
 import OmniVoiceMLX
+import OmniVoiceSim
 
 let usage = """
     omnivoice-bench <command> [options]
@@ -26,6 +27,9 @@ let usage = """
     bench:  --lines PATH (JSON [[text, lang], ...]) --steps N --guidance G --seed N
             --greedy  --profile  --out DIR (write WAVs)  --warmup N (default 1)
             --position-temperature T --class-temperature T
+            --score [--sim-weights F --sim-anchor WAV]  (SIM-o of each output vs anchor)
+    sim-parity: --weights F --ref WAV --list FILE ('path [python_score]' lines)
+            [--scores-out F --emb-out F --tol 0.01 --cache-limit-mb 256]
     synth:  --text TEXT --lang L --out FILE.wav [--steps --seed --duration --instruct --greedy]
     parity: --dump DIR (default /tmp/ovparity) [--bundle fp16]
     """
@@ -96,7 +100,7 @@ func generationOptions(_ a: inout Args) throws -> GenerationOptions {
 }
 
 func runBench(_ argv: ArraySlice<String>) async throws {
-    var a = try Args(argv, flags: ["greedy", "profile", "no-preprocess-ref"])
+    var a = try Args(argv, flags: ["greedy", "profile", "no-preprocess-ref", "score"])
     let tts = try await loadModel(&a)
     let profiler = a.flag("profile") ? StageProfiler() : nil
     let ref = try loadReference(tts, &a, profiler: profiler)
@@ -104,6 +108,9 @@ func runBench(_ argv: ArraySlice<String>) async throws {
     let linesPath = try a.string("lines", "/tmp/omnivoice/lines20.json")
     let outDir = a.optional("out")
     let warmup = try a.int("warmup", 1)
+    let score = a.flag("score")
+    let simWeights = try a.string("sim-weights", SpeakerSimilarityScorer.defaultWeightsURL.path)
+    let simAnchor = try a.string("sim-anchor", "/tmp/omnivoice/ref2.wav")
     try a.checkAllConsumed()
     if opts.seed == nil { opts.seed = 0 }  // fixed default so bench runs are repeatable
 
@@ -121,6 +128,7 @@ func runBench(_ argv: ArraySlice<String>) async throws {
 
     var lat: [Double] = []
     var audioSec: [Double] = []
+    var outputs: [[Float]] = []
     for (i, p) in pairs.enumerated() {
         let t0 = now()
         let s = try tts.synthesize(text: p[0], language: p[1], reference: ref, options: opts, profiler: profiler)
@@ -128,6 +136,7 @@ func runBench(_ argv: ArraySlice<String>) async throws {
         lat.append(dt)
         let dur = Double(s.samples.count) / Double(s.sampleRate)
         audioSec.append(dur)
+        if score { outputs.append(s.samples) }
         if let outDir {
             try AudioIO.writeWAV(s.samples, sampleRate: s.sampleRate,
                                  to: URL(fileURLWithPath: outDir).appendingPathComponent("\(i).wav"))
@@ -148,6 +157,43 @@ func runBench(_ argv: ArraySlice<String>) async throws {
             print(String(format: "  %-24@ total %7.3fs  calls %4d  per-line %.4fs", name, t, c,
                          t / Double(name.hasPrefix("reference") ? 1 : pairs.count)))
         }
+    }
+    if score {
+        let t0 = now()
+        let scorer = try SpeakerSimilarityScorer(weightsURL: URL(fileURLWithPath: simWeights))
+        let anchor = try scorer.embed(contentsOf: URL(fileURLWithPath: simAnchor))
+        let t1 = now()
+        var sims: [Double] = []
+        for (i, o) in outputs.enumerated() {
+            let s = Double(try scorer.similarity(anchor, o, sampleRate: tts.sampleRate))
+            sims.append(s)
+            print(String(format: "  sim[%2d] %.3f", i, s))
+        }
+        let st = Stats(sims)
+        print(String(format: "SIM-o vs %@: mean %.3f  median %.3f  min %.3f  (scorer load+anchor %.2fs, %.3fs/line)",
+                     simAnchor, st.mean, st.median, st.min, t1 - t0, (now() - t1) / Double(outputs.count)))
+        print("memory after scoring: lifetime peak \(gb(ProcessMemory.footprint().peak))")
+    }
+}
+
+func runSimParity(_ argv: ArraySlice<String>) throws {
+    var a = try Args(argv, flags: [])
+    let weights = try a.string("weights", SpeakerSimilarityScorer.defaultWeightsURL.path)
+    let ref = try a.string("ref", "/tmp/omnivoice/ref2.wav")
+    let list = try a.string("list", "/tmp/voice-mlx2/sim.txt")
+    let scoresOut = a.optional("scores-out").map { URL(fileURLWithPath: $0) }
+    let embOut = a.optional("emb-out").map { URL(fileURLWithPath: $0) }
+    let tol = try a.double("tol", 0.01)!
+    setCacheLimit(mb: try a.int("cache-limit-mb", 256))
+    try a.checkAllConsumed()
+    let report = try SimParity.run(
+        weightsURL: URL(fileURLWithPath: weights), refURL: URL(fileURLWithPath: ref),
+        listURL: URL(fileURLWithPath: list), scoresOut: scoresOut, embeddingOut: embOut)
+    print(report.summary)
+    print("memory: lifetime peak \(gb(ProcessMemory.footprint().peak))")
+    let bad = report.failures(tolerance: Float(tol))
+    if !bad.isEmpty {
+        throw BenchError.failed("\(bad.count) file(s) exceed |diff| \(tol)")
     }
 }
 
@@ -313,6 +359,7 @@ do {
     case "synth": try await runSynth(argv.dropFirst(2))
     case "parity": try await runParity(argv.dropFirst(2))
     case "matmul-check": runMatmulCheck()
+    case "sim-parity": try runSimParity(argv.dropFirst(2))
     case "-h", "--help", "help": print(usage)
     default:
         print(usage)

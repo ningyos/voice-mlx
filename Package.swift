@@ -43,6 +43,8 @@ let package = Package(
         ),
         .testTarget(name: "OmniVoiceAudioTests", dependencies: ["OmniVoiceAudio"], exclude: ["Fixtures"]),
         .testTarget(name: "OmniVoiceMLXTests", dependencies: ["OmniVoiceMLX", "OmniVoiceAudio"]),
-        .testTarget(name: "OmniVoiceSimTests", dependencies: ["OmniVoiceSim", "OmniVoiceAudio"]),
+        .testTarget(
+            name: "OmniVoiceSimTests", dependencies: ["OmniVoiceSim", "OmniVoiceAudio"],
+            resources: [.copy("Fixtures")]),
     ]
 )
