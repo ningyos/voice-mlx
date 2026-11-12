@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+*.wav
+*.safetensors
+/out/
+__pycache__/
