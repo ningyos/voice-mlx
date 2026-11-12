@@ -385,6 +385,22 @@ public final class OmniVoiceTTS {
                 mask.asType(.int32).reshaped([-1]).asArray(Int32.self), t)
     }
 
+    /// Logits of the first diffusion step (all-mask target) for parity checks:
+    /// row-major `[C, T, V]` cond (target slice) and uncond, as Float32.
+    public func firstStepLogits(
+        text: String, language: String?, reference: VoiceReference?,
+        options: GenerationOptions = .init()
+    ) throws -> (cond: [Float], uncond: [Float], targetLen: Int) {
+        let (ids, mask, t) = try prepareInputs(
+            text: text, language: language, reference: reference, options: options)
+        let L = ids.dim(2)
+        let cond = model(inputIds: ids, audioMask: mask, lastPositions: t).asType(.float32)
+        let uncond = model(
+            inputIds: ids[0..., 0..., (L - t) ..< L],
+            audioMask: MLXArray.ones([1, t], type: Int32.self)).asType(.float32)
+        return (cond.reshaped([-1]).asArray(Float.self), uncond.reshaped([-1]).asArray(Float.self), t)
+    }
+
     /// Codec decode of `[codebooks, frames]` tokens to raw 24 kHz samples (no post-processing).
     public func decode(codes: [Int32], frames: Int, profiler: StageProfiler? = nil) throws -> [Float] {
         let C = config.numAudioCodebook

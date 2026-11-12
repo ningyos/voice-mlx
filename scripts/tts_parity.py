@@ -95,8 +95,28 @@ def main():
             task.texts[0], task.target_lens[0], task.ref_texts[0], task.ref_audio_tokens[0],
             task.langs[0], task.instructs[0], gen_config.denoise,
         )
+        captured = []
+        orig_forward = model.forward
+
+        def capture(*a, **kw):
+            r = orig_forward(*a, **kw)
+            if not captured:
+                captured.append(r.logits.float().cpu())
+            return r
+
+        model.forward = capture
         with torch.inference_mode():
             tokens = model._generate_iterative(task, gen_config)[0]
+        model.forward = orig_forward
+        # Step-0 logits: cond row (target slice) and uncond row, each [C, T, V].
+        t_len = task.target_lens[0]
+        c_len = inputs["input_ids"].shape[-1]
+        step0 = captured[0]
+        step0[0, :, c_len - t_len : c_len, :].numpy().astype("<f4").tofile(
+            os.path.join(args.out, f"line{i}_step0_cond.f32"))
+        step0[1, :, :t_len, :].numpy().astype("<f4").tofile(
+            os.path.join(args.out, f"line{i}_step0_uncond.f32"))
+        with torch.inference_mode():
             dev = model.audio_tokenizer.device
             raw = model.audio_tokenizer.decode(tokens.to(dev).unsqueeze(0)).audio_values[0].cpu().numpy()
             final = model._decode_and_post_process(tokens, task.ref_rms[0], gen_config)

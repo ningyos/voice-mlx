@@ -9,6 +9,8 @@ import MLXFast
 // live under `llm.*`.
 
 /// Holder for the precomputed RoPE so it isn't registered as a loadable param.
+/// (MLXFast RoPE matches Hugging Face's table-based rotary embedding to the
+/// token level; a CPU-built cos/sin table was tried and gave no parity gain.)
 final class OVFreqs {
     let rope: MLXNN.RoPE
     init(_ cfg: OmniVoiceConfig) {
@@ -50,11 +52,9 @@ final class OVAttention: Module {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (b, l) = (x.dim(0), x.dim(1))
         // [B, L, H, D] → per-head RMSNorm → [B, H, L, D]
-        var q = qNorm(qProj(x).reshaped([b, l, nHeads, headDim])).transposed(0, 2, 1, 3)
-        var k = kNorm(kProj(x).reshaped([b, l, nKVHeads, headDim])).transposed(0, 2, 1, 3)
-        var v = vProj(x).reshaped([b, l, nKVHeads, headDim]).transposed(0, 2, 1, 3)
-        q = freqs.rope(q)
-        k = freqs.rope(k)
+        let q = freqs.rope(qNorm(qProj(x).reshaped([b, l, nHeads, headDim])).transposed(0, 2, 1, 3))
+        let k = freqs.rope(kNorm(kProj(x).reshaped([b, l, nKVHeads, headDim])).transposed(0, 2, 1, 3))
+        let v = vProj(x).reshaped([b, l, nKVHeads, headDim]).transposed(0, 2, 1, 3)
         // Bidirectional: no mask. SDPA handles GQA (q heads > kv heads) directly.
         let out = MLXFast.scaledDotProductAttention(
             queries: q, keys: k, values: v, scale: scale, mask: .none)

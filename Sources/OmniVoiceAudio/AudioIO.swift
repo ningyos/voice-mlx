@@ -6,6 +6,7 @@ public enum AudioIOError: Error, CustomStringConvertible {
     case empty(URL)
     case bufferAllocation(URL)
     case writeFailed(URL, underlying: Error)
+    case shortRead(URL, got: Int, expected: Int)
 
     public var description: String {
         switch self {
@@ -13,6 +14,8 @@ public enum AudioIOError: Error, CustomStringConvertible {
         case .empty(let url): return "audio file has no samples: \(url.path)"
         case .bufferAllocation(let url): return "cannot allocate PCM buffer for \(url.path)"
         case .writeFailed(let url, let e): return "cannot write audio \(url.path): \(e)"
+        case .shortRead(let url, let got, let expected):
+            return "short read from \(url.path): \(got) of \(expected) frames"
         }
     }
 }
@@ -44,24 +47,35 @@ public enum AudioIO {
             throw AudioIOError.unreadable(url, underlying: error)
         }
         let format = file.processingFormat  // deinterleaved Float32
-        let frames = AVAudioFrameCount(file.length)
-        guard frames > 0 else { throw AudioIOError.empty(url) }
-        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
+        let total = Int(file.length)
+        guard total > 0 else { throw AudioIOError.empty(url) }
+        let channels = Int(format.channelCount)
+        let chunk = AVAudioFrameCount(min(total, 1 << 16))
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunk) else {
             throw AudioIOError.bufferAllocation(url)
         }
-        do { try file.read(into: buf) } catch { throw AudioIOError.unreadable(url, underlying: error) }
-        let n = Int(buf.frameLength)
-        let channels = Int(format.channelCount)
-        guard n > 0, let data = buf.floatChannelData else { throw AudioIOError.empty(url) }
-        var mono = Array(UnsafeBufferPointer(start: data[0], count: n))
-        if channels > 1 {
-            for c in 1 ..< channels {
-                let ch = data[c]
-                for i in 0 ..< n { mono[i] += ch[i] }
+        // AVAudioFile may return short reads (e.g. float WAVs with an FLLR chunk),
+        // so read until the declared length is reached.
+        var mono = [Float]()
+        mono.reserveCapacity(total)
+        let inv = 1 / Float(channels)
+        while mono.count < total {
+            do {
+                try file.read(into: buf, frameCount: AVAudioFrameCount(min(Int(chunk), total - mono.count)))
+            } catch { throw AudioIOError.unreadable(url, underlying: error) }
+            let n = Int(buf.frameLength)
+            guard n > 0, let data = buf.floatChannelData else { break }
+            if channels == 1 {
+                mono.append(contentsOf: UnsafeBufferPointer(start: data[0], count: n))
+            } else {
+                for i in 0 ..< n {
+                    var s: Float = 0
+                    for c in 0 ..< channels { s += data[c][i] }
+                    mono.append(s * inv)
+                }
             }
-            let inv = 1 / Float(channels)
-            for i in 0 ..< n { mono[i] *= inv }
         }
+        guard mono.count == total else { throw AudioIOError.shortRead(url, got: mono.count, expected: total) }
         return AudioClip(samples: mono, sampleRate: Int(format.sampleRate))
     }
 

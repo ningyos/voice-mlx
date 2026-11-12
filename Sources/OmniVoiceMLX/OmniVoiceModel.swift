@@ -54,16 +54,23 @@ public final class OmniVoiceModel: Module {
         return MLX.where(mask, audioEmbeds, textEmbeds)
     }
 
-    /// Forward pass → per-codebook logits `[B, numCodebook, L, audioVocabSize]`
-    /// (matches the reference `audio_logits` layout).
-    public func callAsFunction(inputIds: MLXArray, audioMask: MLXArray) -> MLXArray {
+    /// Forward pass → per-codebook logits `[B, numCodebook, L', audioVocabSize]`
+    /// (matches the reference `audio_logits` layout). With `lastPositions`, only
+    /// the trailing positions go through the 8200-wide audio head (L' = that
+    /// count); the backbone still sees the whole sequence.
+    public func callAsFunction(
+        inputIds: MLXArray, audioMask: MLXArray, lastPositions: Int? = nil
+    ) -> MLXArray {
         let embeds = prepareEmbedInputs(inputIds: inputIds, audioMask: audioMask)
-        let hidden = llm(embeds)                                              // [B, L, H]
+        var hidden = llm(embeds)                                              // [B, L, H]
+        if let n = lastPositions, n < hidden.dim(1) {
+            hidden = hidden[0..., (hidden.dim(1) - n)..., 0...]
+        }
         let (b, l) = (hidden.dim(0), hidden.dim(1))
-        let flat = audioHeads(hidden)                                        // [B, L, C*V]
+        let flat = audioHeads(hidden)                                        // [B, L', C*V]
         return flat
-            .reshaped([b, l, cfg.numAudioCodebook, cfg.audioVocabSize])      // [B, L, C, V]
-            .transposed(0, 2, 1, 3)                                          // [B, C, L, V]
+            .reshaped([b, l, cfg.numAudioCodebook, cfg.audioVocabSize])      // [B, L', C, V]
+            .transposed(0, 2, 1, 3)                                          // [B, C, L', V]
     }
 
     /// Load the published bundle's `model.safetensors`. Splits by prefix:

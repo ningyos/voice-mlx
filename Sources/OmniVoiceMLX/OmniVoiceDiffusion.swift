@@ -133,8 +133,8 @@ extension OmniVoiceModel {
             let k = schedule[step]
             if k <= 0 { continue }
 
-            var condLogits = self(inputIds: cond, audioMask: audioMask)[
-                0..., 0..., tStart ..< condLen, 0...]                         // [1, C, T, V]
+            var condLogits = self(inputIds: cond, audioMask: audioMask, lastPositions: targetLen)
+                                                                              // [1, C, T, V]
             if let p = profiler { p.measure("diffusion.cond_forward") { eval(condLogits) } }
             var logProbs: MLXArray
             condLogits = condLogits.asType(.float32)

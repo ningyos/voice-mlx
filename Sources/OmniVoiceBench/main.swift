@@ -11,13 +11,15 @@ let usage = """
                latency, mean/median/max, per-stage profile and peak memory.
       synth    Synthesize one text to a WAV file.
       parity   Compare against dumps from scripts/tts_parity.py.
+      matmul-check  fp32 matmul precision probe (env MM_M/MM_K/MM_N).
 
     Common options:
+      --no-tf32                  exact fp32 matmuls (sets MLX_ENABLE_TF32=0; parity mode)
       --bundle int8|fp16|<dir>   model bundle (default int8)
       --dtype f32|f16|bf16       backbone compute dtype (default f32)
       --cache-limit-mb N         MLX buffer-cache limit (default 1024; -1 = MLX default)
       --ref PATH                 reference audio (default /tmp/omnivoice/ref_plus_zh.wav)
-      --ref-text TEXT | --ref-text-file PATH
+      --ref-text TEXT | --ref-text-file PATH   (default: ref2.txt + " 好，我看一下。")
       --ref-max-seconds S        keep only the first S seconds of the reference
       --no-preprocess-ref        skip reference silence removal / punctuation
 
@@ -55,9 +57,10 @@ func loadReference(_ tts: OmniVoiceTTS, _ a: inout Args, profiler: StageProfiler
     let refText: String
     if let t = a.optional("ref-text") {
         refText = t
-    } else {
-        let f = try a.string("ref-text-file", "/tmp/omnivoice/ref2.txt")
+    } else if let f = a.optional("ref-text-file") {
         refText = try String(contentsOfFile: f, encoding: .utf8)
+    } else {
+        refText = try String(contentsOfFile: "/tmp/omnivoice/ref2.txt", encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines) + " 好，我看一下。"
     }
     var ro = ReferenceOptions()
@@ -170,7 +173,8 @@ func matchRate(_ a: [Int32], _ b: [Int32]) -> Double {
 }
 
 func runParity(_ argv: ArraySlice<String>) async throws {
-    var a = try Args(argv, flags: ["no-preprocess-ref"])
+    var a = try Args(argv, flags: ["no-preprocess-ref", "step0-cpu"])
+    let step0CPU = a.flag("step0-cpu")
     let dump = try a.string("dump", "/tmp/ovparity")
     let tts = try await loadModel(&a, defaultBundle: "fp16")
     let refPath = try a.string("ref", "/tmp/omnivoice/ref_plus_zh.wav")
@@ -218,6 +222,24 @@ func runParity(_ argv: ArraySlice<String>) async throws {
         print("== line \(i) [\(lang)] \(text)")
         let inp = try tts.inspectInputs(text: text, language: lang, reference: ref, options: greedy)
         print("B inputs: target_len \(inp.targetLen) vs \(pyT); ids equal \(inp.inputIds == pyIds); mask equal \(inp.audioMask == pyMask) (L=\(inp.length))")
+        let s0 = dump + "/line\(i)_step0_cond.f32"
+        if FileManager.default.fileExists(atPath: s0) {
+            let pyC = try readF32(s0), pyU = try readF32(dump + "/line\(i)_step0_uncond.f32")
+            let sw = try Device.withDefaultDevice(step0CPU ? Device.cpu : Device.defaultDevice()) {
+                try tts.firstStepLogits(text: text, language: lang, reference: ref, options: greedy)
+            }
+            for (name, a, b) in [("cond", pyC, sw.cond), ("uncond", pyU, sw.uncond)] {
+                let c = compareSignals(a, b)
+                let V = 1025
+                var agree = 0
+                for r in 0 ..< a.count / V {
+                    let ra = a[r * V ..< (r + 1) * V], rb = b[r * V ..< (r + 1) * V]
+                    if ra.indices.max(by: { ra[$0] < ra[$1] }) == rb.indices.max(by: { rb[$0] < rb[$1] }) { agree += 1 }
+                }
+                print(String(format: "S0 %@ logits: max|d| %.4f, SNR %.1f dB, argmax agree %d/%d",
+                             name, c.maxAbs, c.snrDB, agree, a.count / V))
+            }
+        }
         let t0 = now()
         let gen = try tts.generateCodes(text: text, language: lang, reference: ref, options: greedy)
         let dt = now() - t0
@@ -249,7 +271,38 @@ func runParity(_ argv: ArraySlice<String>) async throws {
     }
 }
 
-let argv = CommandLine.arguments
+/// Relative error of MLX fp32 matmul (GPU and CPU streams) against Float64.
+func runMatmulCheck() {
+    let env = ProcessInfo.processInfo.environment
+    let (m, k, n) = (Int(env["MM_M"] ?? "") ?? 64, Int(env["MM_K"] ?? "") ?? 1024, Int(env["MM_N"] ?? "") ?? 1024)
+    let a = MLXRandom.normal([m, k], key: MLXRandom.key(1))
+    let b = MLXRandom.normal([k, n], key: MLXRandom.key(2))
+    let gpu = MLX.matmul(a, b).asArray(Float.self)
+    let cpuOut = MLX.matmul(a, b, stream: .cpu).asArray(Float.self)
+    let av = a.asArray(Float.self), bv = b.asArray(Float.self)
+    var errG = 0.0, errC = 0.0, sig = 0.0
+    for i in 0 ..< 16 {
+        for j in 0 ..< n {
+            var s = 0.0
+            for t in 0 ..< k { s += Double(av[i * k + t]) * Double(bv[t * n + j]) }
+            sig += s * s
+            errG += pow(Double(gpu[i * n + j]) - s, 2)
+            errC += pow(Double(cpuOut[i * n + j]) - s, 2)
+        }
+    }
+    print(String(format: "fp32 matmul SNR vs float64: GPU %.1f dB, CPU %.1f dB",
+                 10 * log10(sig / errG), 10 * log10(sig / errC)))
+}
+
+// `--no-tf32` must take effect before MLX's first matmul: MLX reads
+// MLX_ENABLE_TF32 once, and on GPUs with neural accelerators (M5) it defaults
+// to TF32 for float32 matmuls (~62 dB SNR instead of ~125 dB).
+var argv = CommandLine.arguments
+if let i = argv.firstIndex(of: "--no-tf32") {
+    setenv("MLX_ENABLE_TF32", "0", 1)
+    argv.remove(at: i)
+}
+print("MLX_ENABLE_TF32=\(ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] ?? "unset (default 1)")")
 guard argv.count >= 2 else {
     print(usage)
     exit(2)
@@ -259,6 +312,7 @@ do {
     case "bench": try await runBench(argv.dropFirst(2))
     case "synth": try await runSynth(argv.dropFirst(2))
     case "parity": try await runParity(argv.dropFirst(2))
+    case "matmul-check": runMatmulCheck()
     case "-h", "--help", "help": print(usage)
     default:
         print(usage)
