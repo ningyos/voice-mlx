@@ -30,17 +30,27 @@ class SEBlock: Module {
 
 // MARK: - Res2Net Block
 
+/// `padding="same", padding_mode="reflect"` of the reference TDNN convs, on `[B, T, C]`.
+func reflectPadTime(_ x: MLXArray, _ pad: Int) -> MLXArray {
+    guard pad > 0 else { return x }
+    let t = x.dim(1)
+    let left = MLXArray((1 ... pad).reversed().map { Int32($0) })
+    let right = MLXArray((0 ..< pad).map { Int32(t - 2 - $0) })
+    return concatenated([x.take(left, axis: 1), x, x.take(right, axis: 1)], axis: 1)
+}
+
 class Res2NetBlock: Module {
     @ModuleInfo var blocks: [Conv1d]
     let scaleCount: Int
+    let pad: Int
 
     init(channels: Int, scale: Int = 8, kernelSize: Int = 3, dilation: Int = 1) {
         let width = channels / scale
         self.scaleCount = scale
-        let pad = ((kernelSize - 1) * dilation) / 2
+        self.pad = ((kernelSize - 1) * dilation) / 2
         self._blocks.wrappedValue = (0..<(scale - 1)).map { _ in
             Conv1d(inputChannels: width, outputChannels: width,
-                   kernelSize: kernelSize, padding: pad,
+                   kernelSize: kernelSize, padding: 0,
                    dilation: dilation, bias: true)
         }
         super.init()
@@ -57,8 +67,8 @@ class Res2NetBlock: Module {
                 outputs.append(chunk)
             } else {
                 let input = i == 1 ? chunk : chunk + outputs[i - 1]
-                // Each sub-block is a TimeDelayNetBlock (Conv1d + ReLU)
-                outputs.append(relu(blocks[i - 1](input)))
+                // Each sub-block is a TimeDelayNetBlock (reflect-padded Conv1d + ReLU)
+                outputs.append(relu(blocks[i - 1](reflectPadTime(input, pad))))
             }
         }
 
@@ -135,7 +145,8 @@ class AttentiveStatisticsPooling: Module {
         let attnInput = concatenated([x, meanExpanded, stdExpanded], axis: 2)
 
         // Compute attention weights: [B, T, 3C] → [B, T, C]
-        let alpha = softmax(conv(tanh(tdnn(attnInput))), axis: 1)  // softmax over T
+        // `tdnn` is a TimeDelayNetBlock in the reference: conv + ReLU.
+        let alpha = softmax(conv(tanh(relu(tdnn(attnInput)))), axis: 1)  // softmax over T
 
         // Weighted statistics
         let weightedMean = (alpha * x).sum(axis: 1)  // [B, C]
@@ -191,7 +202,7 @@ public class SpeakerEncoder: Module {
         // Initial TDNN: mel(128) → 512 channels, kernel=5
         self._initialConv.wrappedValue = Conv1d(
             inputChannels: 128, outputChannels: 512,
-            kernelSize: 5, padding: 2, bias: true)
+            kernelSize: 5, padding: 0, bias: true)
 
         // 3 SE-Res2Net blocks with increasing dilation
         self._block1.wrappedValue = ECAPABlock(channels: 512, kernelSize: 3, dilation: 2)
@@ -218,7 +229,7 @@ public class SpeakerEncoder: Module {
     /// - Returns: [B, 1024] speaker embedding
     public func callAsFunction(_ mels: MLXArray) -> MLXArray {
         // Initial TDNN (Conv1d + ReLU)
-        let h0 = relu(initialConv(mels))  // [B, T, 512]
+        let h0 = relu(initialConv(reflectPadTime(mels, 2)))  // [B, T, 512]
 
         // 3 SE-Res2Net blocks
         let out1 = block1(h0)
