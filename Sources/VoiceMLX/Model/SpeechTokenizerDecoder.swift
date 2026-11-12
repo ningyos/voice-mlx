@@ -99,12 +99,18 @@ public class SnakeBeta: Module {
         super.init()
     }
 
+    /// The elementwise body as one fused kernel (the activation runs on up to
+    /// `T * 1920` samples × 96–1536 channels, so unfused it is bandwidth-bound).
+    static let fused = compile(shapeless: true) { (x: MLXArray, a: MLXArray, invB: MLXArray) -> MLXArray in
+        let sinTerm = sin(a * x)
+        return x + invB * (sinTerm * sinTerm)
+    }
+
     /// Input: [B, T, C] (NLC format)
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let a = exp(alpha)  // [1, 1, C]
         let b = exp(beta)   // [1, 1, C]
-        let sinTerm = sin(a * x)
-        return x + (1.0 / b) * (sinTerm * sinTerm)
+        return Self.fused(x, a, 1.0 / b)
     }
 }
 
