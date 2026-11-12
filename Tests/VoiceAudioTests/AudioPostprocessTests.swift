@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import OmniVoiceAudio
+@testable import VoiceAudio
 
 final class AudioPostprocessTests: XCTestCase {
     private func tone(_ count: Int, sampleRate: Int = 24000, amplitude: Float = 0.5) -> [Float] {

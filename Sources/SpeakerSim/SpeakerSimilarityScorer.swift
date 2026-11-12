@@ -1,6 +1,6 @@
 import Foundation
 import MLX
-import OmniVoiceAudio
+import VoiceAudio
 
 /// SIM-o speaker-similarity scorer: MLX port of OmniVoice's evaluation model
 /// (`omnivoice.eval.models.ecapa_tdnn_wavlm.ECAPA_TDNN_WAVLM`, WavLM-large + ECAPA-TDNN,

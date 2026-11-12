@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import OmniVoiceAudio
+@testable import VoiceAudio
 
 /// Compares the Swift port against Python reference outputs written by
 /// `scripts/postproc_parity.py`. Skipped unless `OMNIVOICE_POSTPROC_PARITY_DIR` points at

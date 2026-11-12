@@ -2,49 +2,51 @@
 import PackageDescription
 
 let package = Package(
-    name: "omnivoice-mlx",
+    name: "voice-mlx",
     platforms: [.macOS("15.0")],
     products: [
-        .library(name: "OmniVoiceMLX", targets: ["OmniVoiceMLX"]),
-        .library(name: "OmniVoiceSim", targets: ["OmniVoiceSim"]),
-        .library(name: "OmniVoiceAudio", targets: ["OmniVoiceAudio"]),
-        .executable(name: "omnivoice-bench", targets: ["OmniVoiceBench"]),
+        .library(name: "VoiceMLX", targets: ["VoiceMLX"]),
+        .library(name: "SpeakerSim", targets: ["SpeakerSim"]),
+        .library(name: "VoiceAudio", targets: ["VoiceAudio"]),
+        .executable(name: "voice-bench", targets: ["VoiceBench"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.6"),
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.4.0"),
     ],
     targets: [
-        .target(name: "OmniVoiceAudio"),
+        .target(name: "VoiceAudio"),
         .target(
-            name: "OmniVoiceMLX",
+            name: "VoiceMLX",
             dependencies: [
-                "OmniVoiceAudio",
+                "VoiceAudio",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "Hub", package: "swift-transformers"),
-                .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
         .target(
-            name: "OmniVoiceSim",
+            name: "SpeakerSim",
             dependencies: [
-                "OmniVoiceAudio",
+                "VoiceAudio",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
             ]
         ),
         .executableTarget(
-            name: "OmniVoiceBench",
-            dependencies: ["OmniVoiceMLX", "OmniVoiceSim", "OmniVoiceAudio"]
+            name: "VoiceBench",
+            dependencies: [
+                "VoiceMLX", "SpeakerSim", "VoiceAudio",
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ]
         ),
-        .testTarget(name: "OmniVoiceAudioTests", dependencies: ["OmniVoiceAudio"], exclude: ["Fixtures"]),
-        .testTarget(name: "OmniVoiceMLXTests", dependencies: ["OmniVoiceMLX", "OmniVoiceAudio"]),
+        .testTarget(name: "VoiceAudioTests", dependencies: ["VoiceAudio"], exclude: ["Fixtures"]),
+        .testTarget(name: "VoiceMLXTests", dependencies: ["VoiceMLX", "VoiceAudio"]),
         .testTarget(
-            name: "OmniVoiceSimTests", dependencies: ["OmniVoiceSim", "OmniVoiceAudio"],
+            name: "SpeakerSimTests", dependencies: ["SpeakerSim", "VoiceAudio"],
             resources: [.copy("Fixtures")]),
     ]
 )

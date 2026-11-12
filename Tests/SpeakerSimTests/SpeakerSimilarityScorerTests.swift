@@ -1,8 +1,8 @@
 import Foundation
-import OmniVoiceAudio
+import VoiceAudio
 import XCTest
 
-@testable import OmniVoiceSim
+@testable import SpeakerSim
 
 final class SpeakerSimilarityScorerTests: XCTestCase {
     func testCosineSanity() {
