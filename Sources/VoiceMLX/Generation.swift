@@ -226,10 +226,10 @@ extension Qwen3Voice {
         hidden = hidden[0..., (L - 1) ..< L, 0...]
 
         let vocab = talkerConfig.codecVocabSize
-        var generatedMask = [Bool](repeating: false, count: vocab)
-        var anyGenerated = false
+        let vocabIds = MLXArray(Int32(0) ..< Int32(vocab))
+        var penalty = MLXArray.zeros([vocab], dtype: .bool)  // tokens generated so far
+        var frameCodes: [MLXArray] = []  // per frame: [16] int32 on device
         var codes: [Int32] = []
-        codes.reserveCapacity(16 * 256)
         var frames = 0
         var finished = false
         var emittedFrames = 0
@@ -241,9 +241,17 @@ extension Qwen3Voice {
             return (ks[1], ks[2])
         }
 
+        /// Host copies of the codes of frames `codes.count / 16 ..< upTo`.
+        func syncCodes(upTo: Int) {
+            let have = codes.count / 16
+            guard upTo > have else { return }
+            codes += concatenated(Array(frameCodes[have ..< upTo]), axis: 0).asArray(Int32.self)
+        }
+
         func emit(upTo end: Int, final: Bool) throws {
             guard let onChunk, let streaming else { return }
             let t0 = now()
+            syncCodes(upTo: end)
             let startF = emittedFrames
             // Left context from earlier generated frames, then reference frames.
             let ctx = min(streaming.leftContextFrames, startF + refFrames)
@@ -262,48 +270,60 @@ extension Qwen3Voice {
             try onChunk(AudioChunk(samples: samples, frames: startF ..< end, isFinal: final, elapsed: now() - start))
         }
 
+        // The loop runs one frame ahead of the host: the graph for frame s+1 (code
+        // predictor of s, talker step, sampling of s+1) is built and queued with
+        // asyncEval before the host reads frame s's first code for the EOS check, so
+        // graph construction overlaps GPU work. Numerics are unchanged; when frame s
+        // is EOS the queued speculative frame is discarded.
+        let (kT0, kC0) = split3()
+        var code0 = sampleFirstCode(logits: logits, generated: nil, step: 0, sampling: sampling, key: kT0)
+        var kCP = kC0
+        asyncEval(code0)
         var tStep = now()
-        if profile { eval(logits, hidden); timings.prefill = now() - start; tStep = now() }
+        if profile { eval(code0); timings.prefill = now() - start; tStep = now() }
         for step in 0 ..< sampling.maxNewTokens {
-            let (kTalker, kCP) = split3()
-            let code0 = sampleFirstCode(
-                logits: logits, generated: anyGenerated ? MLXArray(generatedMask) : nil, step: step,
-                sampling: sampling, key: kTalker)
+            let tCP = now()
+            let rest = predictFrame(hidden: hidden, code0: code0, sampling: sampling, key: kCP)
+            if profile { eval(rest); timings.codePredictor += now() - tCP }
+            let frame = concatenated([code0.reshaped(1), rest])
+            var next: MLXArray?
+            if step + 1 < sampling.maxNewTokens {
+                penalty = logicalOr(penalty, vocabIds .== code0)
+                // Next talker input: sum of the 16 codebook embeddings + trailing text.
+                var embed = talker.embedCodec(code0.reshaped(1, 1))
+                for g in 1 ..< 16 {
+                    embed = embed + codePredictor.codecEmbeddings[g - 1](rest[(g - 1) ..< g].reshaped(1, 1))
+                }
+                let t = prompt.trailing.dim(1)
+                embed = embed + (step < t ? prompt.trailing[0..., step ..< (step + 1), 0...] : prompt.ttsPad)
+                let tT = now()
+                (logits, hidden, cache) = talkerStep(embed, offset: L + step, cache: cache)
+                if profile { eval(logits, hidden); timings.talker += now() - tT }
+                let (kT, kC) = split3()
+                kCP = kC
+                next = sampleFirstCode(
+                    logits: logits, generated: penalty, step: step + 1, sampling: sampling, key: kT)
+                asyncEval(frame, next!)
+            } else {
+                asyncEval(frame)
+            }
+            // EOS check on frame `step` (already computed or in flight).
             let c0 = code0.item(Int32.self)
             if step == 0 && !profile { timings.prefill = now() - start; tStep = now() }
             if c0 == Int32(SpecialTokens.codecEos) {
                 finished = true
                 break
             }
-            generatedMask[Int(c0)] = true
-            anyGenerated = true
-
-            let tCP = now()
-            let rest = predictFrame(hidden: hidden, code0: code0, sampling: sampling, key: kCP)
-            if profile { eval(rest); timings.codePredictor += now() - tCP }
-            let restHost = rest.asArray(Int32.self)
-            codes.append(c0)
-            codes += restHost
+            frameCodes.append(frame)
             frames += 1
-
             if let streaming, onChunk != nil {
                 let due = emittedFrames == 0 ? streaming.firstChunkFrames : emittedFrames + streaming.chunkFrames
                 if frames >= due { try emit(upTo: frames, final: false) }
             }
-            if step == sampling.maxNewTokens - 1 { break }
-
-            // Next talker input: sum of the 16 codebook embeddings + trailing text.
-            let frameIds = MLXArray(codes[(codes.count - 16)...])
-            var embed = talker.embedCodec(frameIds[0 ..< 1].reshaped(1, 1))
-            for g in 1 ..< 16 {
-                embed = embed + codePredictor.codecEmbeddings[g - 1](frameIds[g ..< (g + 1)].reshaped(1, 1))
-            }
-            let t = prompt.trailing.dim(1)
-            embed = embed + (step < t ? prompt.trailing[0..., step ..< (step + 1), 0...] : prompt.ttsPad)
-            let tT = now()
-            (logits, hidden, cache) = talkerStep(embed, offset: L + step, cache: cache)
-            if profile { eval(logits, hidden); timings.talker += now() - tT }
+            guard let next else { break }
+            code0 = next
         }
+        syncCodes(upTo: frames)
         if !profile { timings.talker = now() - tStep }
 
         if let streaming, onChunk != nil {
