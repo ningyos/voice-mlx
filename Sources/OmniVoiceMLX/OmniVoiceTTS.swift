@@ -394,7 +394,7 @@ public final class OmniVoiceTTS {
         let (ids, mask, t) = try prepareInputs(
             text: text, language: language, reference: reference, options: options)
         let L = ids.dim(2)
-        let cond = model(inputIds: ids, audioMask: mask, lastPositions: t).asType(.float32)
+        let cond = model(inputIds: ids, audioMask: mask)[0..., 0..., (L - t) ..< L, 0...].asType(.float32)
         let uncond = model(
             inputIds: ids[0..., 0..., (L - t) ..< L],
             audioMask: MLXArray.ones([1, t], type: Int32.self)).asType(.float32)
