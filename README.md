@@ -166,6 +166,58 @@ swift build -c release
 .build/release/voice-bench parity --dump /tmp/vmlx/parity_base                       # production numerics
 ```
 
+## Streaming: stateful codec decoder (measured)
+
+Every stage of the 12 Hz codec decoder is causal: RVQ lookup, causal convs (left padding),
+an 8-layer transformer with causal sliding-window attention (window 72), transposed-conv
+upsamplers (kernel = 2 × stride, right-trimmed) and SnakeBeta / LayerNorm / RMSNorm, which
+are per-time-step. So a chunk can be decoded exactly from a small carried state
+(`CodecDecoderState`, `SpeechTokenizerDecoder.decodeStep`):
+
+- each transformer layer keeps the last 71 RoPE'd keys/values (the most any later query can
+  see); new frames use their absolute RoPE position and the whole-sequence mask restricted
+  to the new rows;
+- each causal conv keeps its last `(kernel − 1) · dilation` input samples (replacing the
+  zero padding); each `2s`-kernel transposed conv keeps its last input frame and returns
+  only the new frames' outputs; the `s`-kernel pre-upsamplers need no state.
+
+ICL seeding: the reference codes are run through the decoder once per reference (cached on
+the model, keyed by the reference codes) in 12-frame chunks, so chunk 1 starts from the same
+state the non-streamed decode (reference + target, then cut, as in `qwen_tts`) has at the
+cut. Default: the whole reference (`StreamingOptions.referenceSeedFrames = nil`). The
+transformer's receptive field (8 layers × 71 frames) exceeds a 19 s reference, so seeding
+from a tail is not exact: measured below, the tail costs audible-range SNR in the first
+second for 72 frames and ~2.5 dB for 150, against a one-time ~1 s for the whole reference.
+The speaker path starts from a fresh (zero) state. The old left-context re-decode
+(`leftContextFrames`) is gone.
+
+Parity, lines20 × seeds 0,1 (40 utterances; 36 longer than 1 s), streamed with default
+chunking (4, then 12 frames) vs a whole decode of reference + the same tokens, cut at the
+reference (`voice-bench stream-parity`). With these lines reference + target is ≤ 294 frames,
+under the reference's 300-frame decode chunk, so `generate` is the same whole decode.
+
+| Seeding | Numerics | SNR first 1 s (mean / min) | SNR rest (mean / min) | vs `generate` (mean / min) |
+|---|---|---|---|---|
+| **whole reference (default)** | f32, TF32 off (`--no-tf32`) | **114.9 / 109.8 dB** | **116.4 / 104.6 dB** | 115.1 / 109.8 dB |
+| **whole reference (default)** | production (TF32 on) | 48.3 / 40.0 dB | 50.2 / 42.9 dB | 48.7 / 40.6 dB |
+| last 150 reference frames | production | 45.8 / 31.6 dB | 49.4 / 42.5 dB | 46.6 / 32.4 dB |
+| last 72 reference frames | production | 29.2 / 10.9 dB | 33.2 / 17.0 dB | 30.3 / 11.6 dB |
+| *before:* 72-frame left-context re-decode | production | — | — | 29.0 / 10.0 dB |
+| *before:* 150-frame left-context re-decode | production | — | — | 49.4 / 36.7 dB |
+
+With exact float32 the streamed audio equals the whole decode to float rounding (≥ 105 dB).
+In production the codec's float32 matmuls run as TF32 on M5; chunked and whole decodes then
+round differently (different matmul shapes), which is what the 48–50 dB measures (same order
+as the codec's 43–51 dB vs PyTorch in Parity; a TF32 whole-vs-whole floor was not measured
+separately). Streamed tokens equal `generate`'s for every line, seed and seeding variant
+(160 streamed runs). SIM-o vs `ref2.wav`: 0.570 streamed (0.565 before, 0.570
+non-streamed).
+
+`generate` keeps the reference's 300-frame chunked decode (25 frames of left context), so for
+reference + target beyond 300 frames the two paths differ after frame 300 (the streamed one
+is the exact whole-sequence decode there). Listening WAVs: `/tmp/vmlx/stateful/` (streamed),
+same names as `/tmp/vmlx/cmp/` (non-streamed).
+
 ## Measured on Apple M5, 16 GB
 
 macOS 27.0.1, mlx-swift 0.31.6, release build, MLX cache limit 256 MB, bf16 activations,
@@ -201,6 +253,7 @@ Per stage (Base 8-bit, ICL, lines20; `--profile` forces an eval per stage):
 | Talker step (28 layers, 8-bit) | 8.6 ms/frame serialized |
 | Code predictor (15 groups × 5 layers) | 14.4 ms/frame serialized |
 | Talker + code predictor, pipelined (production) | 18.4 ms/frame (12.5 frames = 1 s audio) |
+| Same, streaming (chunk decodes excluded since the stateful decoder; before they were included) | 20.6–21.2 ms/frame (same session non-streamed: 21.2; before: 45.8 incl. 72-frame-context decodes) |
 | Codec decode, non-streamed (reference + target, reference chunking) | 0.75–0.78 s/line |
 | Codec decode, streaming (stateful, new frames only) | 0.12 s/line (lines20 × 2 seeds) |
 | Streaming decoder seeding (once per reference, 239 frames) | 0.9–1.2 s on first use, then cached |
@@ -225,7 +278,33 @@ WAVs for the same seed on lines20). A/B on lines20, Base 8-bit, seed 0.
 | `compile` the stateful decoder step (per shape) | stream: 0.68 s (no compile) vs 0.72 / 0.73 s (compiled), decode 0.117 vs 0.122 s/line | identical | rejected (not faster) |
 | Seed the decoder in 60-frame chunks instead of 12 | seeding 0.75 vs 0.9 s once; peak 4.8 vs 3.0 GB | same state up to float rounding (state is chunk-invariant, tested) | 12 kept (memory) |
 | Code predictor: q/k/v and gate/up as one concatenated quantized matmul each (−3 kernels per layer) | 14.35 → 14.49–14.55 ms/frame (`cp-probe`) | not checked | rejected (not faster) |
-| Code predictor: merge attention heads by reshape when T = 1 | 14.39 → 14.39–14.41 ms/frame | identical | rejected (no change; MLX already avoids the copy) |
+| Code predictor: merge attention heads by reshape when T = 1 | 14.39 → 14.39–14.41 ms/frame | not checked | rejected (no change; MLX already avoids the copy) |
+| MLX command buffers: `MLX_MAX_MB_PER_BUFFER=4000` (± `MLX_MAX_OPS_PER_BUFFER=400`) instead of the M5 defaults 40 MB / 40 ops | code predictor 14.40–14.44 → 14.44 (MB only), 15.28–15.32 ms/frame (both) | not checked (buffer boundaries only) | rejected (not faster) |
+| Non-streamed path after the decoder change (re-check) | lines20 × 2 seeds, same session: 1.52 s (`fb1a6b8`) vs 1.55 s; talker 21.6 vs 22.5 ms/frame; machine busier than in the table above | WAVs byte-identical (40/40) | — |
+
+### Code predictor: where the time goes (measured, `voice-bench cp-probe`)
+
+The 15-group loop of one frame (5 layers × 15 groups, sampling included) is already one
+compiled graph (`compile` of the whole loop, `predictFrame`). Split of its 14.2–14.6 ms/frame:
+
+| Probe | Result |
+|---|---|
+| Real model, eval per frame / all frames queued before one eval | 14.3–14.6 / 14.4–14.7 ms (no host-sync gap) |
+| Weights read per frame (5 layers + norm + one lm head, × 15; 8-bit + bf16 scales) | 1287 MB |
+| Large 8-bit qmv bandwidth on this M5 (best of 5) | 126–134 GB/s → weight floor 9.6–10.2 ms |
+| Same graph with hidden 64 (negligible traffic and math; same op structure) | 5.3–5.7 ms |
+| Greedy instead of top-k sampling | 14.15 ms (sampling costs ≈ 0.25 ms) |
+| Talker step weights (28 layers + codec head) | 471 MB → 3.6 ms; talker + predictor floor 13.4–13.7 ms vs 18.4 ms/frame measured (pipelined) |
+
+So the predictor is mostly weight-bandwidth-bound (≈ 10 of 14.4 ms) with ≈ 4.5 ms of fixed
+cost per frame, about what the hidden-64 graph costs on its own. Fusing independent
+projections (q/k/v, gate/up: 3 fewer kernels per layer) changed neither the real nor the
+hidden-64 time, so the fixed cost tracks the chain of dependent kernels (~13 per layer plus
+sampling, ×15 groups), not the kernel count [inference from these two probes; GPU-side
+per-stage latency vs CPU encoding not separated]. Cutting that chain needs custom Metal
+kernels on the critical path (e.g. add + RMSNorm, norm + RoPE + cache write); they change
+reduction order, so identical tokens are unlikely, for ≤ 4.5 ms/frame at best. Not attempted
+(see the optimization log for what was tried); ms/frame before/after: unchanged.
 
 ## 8-bit vs bf16 on the speaker path (user decision: 8-bit ships; evidence)
 
@@ -260,16 +339,24 @@ $PY scripts/export_sim_weights.py
 ## Open issues
 
 - Codec decoder working set: up to ~7 GB process peak when decoding the full 19 s reference
-  plus target (reference behaviour). Use streaming (< 4 GB) or `referenceDecodeContextFrames`
+  plus target (reference behaviour). Use streaming (3.0 GB) or `referenceDecodeContextFrames`
   (changes audio slightly) if memory matters more than exact reference decoding.
 - Greedy decoding can run to `maxNewTokens` without EOS (PyTorch too); sampling is the
   default. Keep `maxNewTokens` capped (default 2048 frames ≈ 164 s); voice-train saw a
   fine-tune run away to max tokens.
-- Streaming chunks are decoded with 72 frames of left context (the decoder's sliding
-  window). The old default of 25 gave audible artifacts: against the non-streamed waveform
-  of the same tokens, SNR was 9.8 dB (min −2.6) at 25 frames, 29.0 dB (min 10.0) at 72 and
-  49.4 dB (min 36.7) at 150; SIM 0.551 / 0.565 / 0.569 (non-streamed 0.570). Each chunk
-  re-decodes its context, so a longer context costs first-audio time and memory.
+- Streaming before the stateful decoder re-decoded a left context per chunk: against the
+  non-streamed waveform of the same tokens, SNR was 9.8 dB (min −2.6) with 25 frames (audible
+  artifacts), 29.0 dB (min 10.0) with 72 and 49.4 dB (min 36.7) with 150; SIM 0.551 / 0.565 /
+  0.569 (non-streamed 0.570). Replaced; see Streaming.
+- The first streamed line with a new reference pays the decoder seeding (~1 s, reported as
+  `StageTimings.decoderSeed`, included in first-audio time); later lines reuse the cached
+  state. Only the last reference is cached.
+- The talker loop measured 18.4 ms/frame earlier on 2026-11-13 but 20.5–21.2 ms/frame later
+  the same evening for both streaming and non-streamed runs (cause not checked; other
+  processes were running); chunk syncs cost nothing measurable (default 12-frame chunks 20.6
+  vs one big chunk 20.5 ms/frame).
+  The ≈ 50 ms/frame streaming figure before the stateful decoder was the chunk decodes being
+  counted in the talker time, not GPU contention.
 - 4-bit weights were tried (quantized at load from the bf16 bundle) and dropped: no memory
   saved (the peak is the codec decoder), SIM 0.540 vs 0.551, and one line ran to
   `maxNewTokens` with both seeds where 8-bit stopped normally.
@@ -282,7 +369,11 @@ $PY scripts/export_sim_weights.py
 directory / file, incomplete weights, 8-bit bundle requested as bf16); unknown language and
 unknown speaker throw; seed reproducibility (same seed ⇒ identical tokens and audio,
 different seed differs, reported seed replays an unseeded run); reference reuse + `Codable`
-round trip; streaming covers the utterance with the same tokens as `generate`; pydub /
+round trip; streaming covers the utterance with the same tokens as `generate` and the same
+audio (> 30 dB with TF32); stateful decoder on a small random-init fixture (CPU stream, exact
+fp32): chunked (uneven chunks, incl. 1-frame and longer-than-window) == whole decode
+(> 90 dB) and the state is chunking-invariant (a 1-key-short attention cache fails both at
+~60 dB); compiled code-predictor frame == eager loop tokens (sampled and greedy); pydub /
 torchaudio ports; scorer parity on two committed fixtures. Model-backed tests skip
 (XCTSkip) when the cached bundles, `/tmp/omnivoice/speaker_ref2.wav` or the scorer weights are
 absent.
