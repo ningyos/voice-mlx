@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXRandom
 import VoiceAudio
 import XCTest
 
@@ -187,6 +188,33 @@ private func snrDB(_ ref: [Float], _ x: [Float]) -> Double {
     return 10 * log10(sig / max(err, 1e-30))
 }
 
+final class CodePredictorTests: XCTestCase {
+    /// The compiled 15-group loop (production) gives the same codebook tokens as the same
+    /// loop run eagerly, sampled with fixed keys and greedy.
+    func testCompiledFrameMatchesEagerLoop() throws {
+        guard let m = Shared.base else { throw XCTSkip("Base bundle missing") }
+        let groups = m.cpConfig.numCodeGroups - 1
+        for (i, sampling) in [SamplingOptions(), SamplingOptions.greedy].enumerated() {
+            let greedy = !sampling.subtalkerDoSample
+            for f in 0 ..< 8 {
+                let hidden = MLXRandom.normal([1, 1, m.cpConfig.hiddenSize], key: MLXRandom.key(UInt64(100 * i + f)))
+                    .asType(m.computeDType)
+                let code0 = MLXArray(Int32(37 * f + 5))
+                let key = MLXRandom.key(UInt64(7 + f))
+                let compiled = m.predictFrame(hidden: hidden, code0: code0, sampling: sampling, key: key)
+                let gumbels = greedy
+                    ? MLXArray.zeros([groups, m.cpConfig.vocabSize])
+                    : MLXRandom.gumbel([groups, m.cpConfig.vocabSize], key: key)
+                let input = concatenated([hidden, m.talker.embedCodec(code0.reshaped(1, 1))], axis: 1)
+                let eager = m.codePredictor.predictFrame(
+                    inputsEmbeds: input, temperature: MLXArray(sampling.subtalkerTemperature), gumbels: gumbels,
+                    topK: greedy ? 0 : sampling.subtalkerTopK, greedy: greedy)
+                XCTAssertEqual(compiled.asArray(Int32.self), eager.asArray(Int32.self), "sampling \(i), frame \(f)")
+            }
+        }
+    }
+}
+
 final class CodecDecoderStreamingTests: XCTestCase {
     /// A small randomly initialised decoder (deterministic): window 8 so the attention
     /// caches evict within a short fixture; every conv / transposed-conv shape kind is kept.
@@ -210,7 +238,13 @@ final class CodecDecoderStreamingTests: XCTestCase {
         return d
     }
 
-    func testChunkedStatefulDecodeEqualsWholeDecode() {
+    // On the CPU stream: float32 matmuls are exact there, while the M5 GPU runs them as TF32
+    // (~60 dB), which would hide a state bug of similar size.
+    func testChunkedStatefulDecodeEqualsWholeDecode() { Device.withDefaultDevice(.cpu) { chunkedEqualsWhole() } }
+
+    func testStateIsChunkingInvariant() { Device.withDefaultDevice(.cpu) { chunkingInvariant() } }
+
+    private func chunkedEqualsWhole() {
         let d = smallDecoder()
         let frames = 41
         let codes = MLXRandom.randInt(0 ..< 64, [1, 16, frames], key: MLXRandom.key(1)).asType(.int32)
@@ -230,7 +264,7 @@ final class CodecDecoderStreamingTests: XCTestCase {
         XCTAssertGreaterThan(snrDB(whole, streamed), 90)
     }
 
-    func testStateIsChunkingInvariant() {
+    private func chunkingInvariant() {
         // A state built in one chunk continues exactly like one built frame by frame.
         let d = smallDecoder()
         let codes = MLXRandom.randInt(0 ..< 64, [1, 16, 30], key: MLXRandom.key(2)).asType(.int32)

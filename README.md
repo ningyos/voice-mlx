@@ -31,8 +31,11 @@ commit `468db5f`):
   (codec tokens + x-vector + transcript); every `generate` call reuses it.
 - **Seedable, reproducible sampling.** All randomness comes from an MLX PRNG key derived
   from a `UInt64` seed; `seed: nil` draws one and reports it so any run can be replayed.
-- **Streaming.** `generateStreaming` / `stream` emit audio chunks while codec frames are
-  produced (first chunk after 4 frames by default).
+- **Streaming with a stateful codec decoder.** `generateStreaming` / `stream` emit audio
+  chunks while codec frames are produced (first chunk after 4 frames). Each chunk decodes
+  only its new frames; the decoder carries its attention K/V and causal-conv tails across
+  chunks and is seeded once per reference, so the streamed audio equals the non-streamed
+  decode of the same tokens up to float rounding (see Streaming).
 - **Errors surface.** Unknown languages throw (speech-swift silently fell back to `auto`/
   English), unknown speakers throw, missing files throw, and the loader verifies that
   every parameter was set from the checkpoint with the right shape (speech-swift's
@@ -104,6 +107,8 @@ swift build -c release
 .build/release/voice-bench synth --text "好，我看一下。" --lang zh --out /tmp/a.wav          # Base ICL, default reference
 .build/release/voice-bench synth --model /path/bundle-8bit --speaker <speaker> --lang auto --text "..." --out /tmp/b.wav
 .build/release/voice-bench bench --lines /tmp/omnivoice/lines20.json --seeds 0,1 --out /tmp/w --score [--stream] [--profile]
+.build/release/voice-bench stream-parity --seeds 0,1 [--seed-frames-list 72,150] [--no-tf32]   # streamed vs whole decode
+.build/release/voice-bench cp-probe                                                            # code predictor cost split
 ```
 
 ## Parity with the official `qwen-tts` (measured)
@@ -172,8 +177,9 @@ running, so expect ±5 % noise. Measured 2026-11-13.
 | Config | Lines | Mean | Median | Max | First audio (stream) | Peak |
 |---|---|---|---|---|---|---|
 | **Base 8-bit, ICL 19 s ref** | lines20 (14 zh, 6 en) | **1.30 s** | 1.32 s | 1.86 s | — | 7.3 GB |
-| Base 8-bit, ICL, streaming, 25-frame left context (old default) | lines20 | 1.08 s (to last chunk) | 1.00 s | 2.14 s | **0.22 s** (max 0.23) | 3.8 GB |
-| **Base 8-bit, ICL, streaming, 72-frame left context (default)** | lines20 × seeds 0,1 | 1.58 s (to last chunk) | 1.42 s | 2.93 s | **0.39 s** (max 0.40) | 5.3 GB |
+| **Base 8-bit, ICL, streaming, stateful decoder (default)** | lines20 × seeds 0,1 | **0.72 s** (to last chunk) | 0.65 s | 1.37 s | **0.13 s** (max 0.15) | 3.0 GB |
+| Base 8-bit, ICL, streaming, 72-frame left-context re-decode (before, `fb1a6b8`) | lines20 × seeds 0,1 | 1.50 s (to last chunk) | 1.33 s | 2.74 s | 0.36 s (max 0.38) | 5.3 GB |
+| Base 8-bit, ICL, streaming, 25-frame left context (older default; audible artifacts) | lines20 | 1.08 s (to last chunk) | 1.00 s | 2.14 s | 0.22 s (max 0.23) | 3.8 GB |
 | Base 8-bit, ICL (before the kept optimizations) | 8 short lines (`qw_lines` 0–7) | 1.09 s | 1.07 s | 1.19 s | — | 5.6 GB |
 | Speaker path 8-bit (voice-train smoke bundle, one speaker, `auto`) | lines20 × seeds 0,1 | 0.67 s | 0.62 s | 1.17 s | — | see note |
 | Speaker path bf16 (same bundle) | lines20 × seeds 0,1 | 1.07 s | 1.00 s | 1.85 s | — | 4.6 GB |
@@ -183,8 +189,8 @@ running, so expect ±5 % noise. Measured 2026-11-13.
 \* one sampled line ran long (RTF 0.26 overall); latency scales with output length.
 Note: speaker-path peaks of 7–8 GB come from the codec decoder's working set on the
 longest lines (≈ 2 GB for 56 frames, ≈ 4–5 GB for the ~250 frames of reference + target in
-ICL); a single 18-frame line peaks at 2.9 GB. Streaming decodes small chunks and stays
-under 4 GB.
+ICL); a single 18-frame line peaks at 2.9 GB. Streaming decodes 12-frame chunks (and seeds
+in 12-frame chunks) and peaks at 3.0 GB.
 
 Per stage (Base 8-bit, ICL, lines20; `--profile` forces an eval per stage):
 
@@ -195,7 +201,9 @@ Per stage (Base 8-bit, ICL, lines20; `--profile` forces an eval per stage):
 | Talker step (28 layers, 8-bit) | 8.6 ms/frame serialized |
 | Code predictor (15 groups × 5 layers) | 14.4 ms/frame serialized |
 | Talker + code predictor, pipelined (production) | 18.4 ms/frame (12.5 frames = 1 s audio) |
-| Codec decode (reference + target, reference chunking) | 0.75–0.78 s/line |
+| Codec decode, non-streamed (reference + target, reference chunking) | 0.75–0.78 s/line |
+| Codec decode, streaming (stateful, new frames only) | 0.12 s/line (lines20 × 2 seeds) |
+| Streaming decoder seeding (once per reference, 239 frames) | 0.9–1.2 s on first use, then cached |
 | Model load from local cache | 0.6–1.0 s (bundle), 1.8–2.3 GB footprint after load |
 
 Not measured: cold first load incl. download, other Macs, 1.7B.
@@ -213,6 +221,11 @@ WAVs for the same seed on lines20). A/B on lines20, Base 8-bit, seed 0.
 | `eval` after each decoder block (to bound memory) | 1.30 → 1.45 s; peak 7.3 → 6.1 GB | identical | rejected (slower) |
 | `partitioned` instead of full sort for top-k threshold | 18.48 → 18.36 ms/frame, 1.30 → 1.28 s | identical | rejected (inside noise) |
 | Decode only the last N reference frames (`referenceDecodeContextFrames`) | N=72: 1.58 → 0.98 s; N=25: → 0.80 s (measured on the baseline) | audio changes: mean \|Δlog-mel\| 0.04 (N=72), 0.33 (N=25) vs full-reference decode | option only, default off |
+| Stateful streaming decoder (carry K/V + conv tails, seed from the reference once) instead of re-decoding 72 frames of left context per chunk | stream (lines20 × 2 seeds): 1.50 → 0.72 s; first audio 0.36 → 0.13 s; decode 0.89 → 0.12 s/line; peak 5.3 → 3.0 GB | tokens identical; audio = whole decode to float rounding (Streaming) | **kept** |
+| `compile` the stateful decoder step (per shape) | stream: 0.68 s (no compile) vs 0.72 / 0.73 s (compiled), decode 0.117 vs 0.122 s/line | identical | rejected (not faster) |
+| Seed the decoder in 60-frame chunks instead of 12 | seeding 0.75 vs 0.9 s once; peak 4.8 vs 3.0 GB | same state up to float rounding (state is chunk-invariant, tested) | 12 kept (memory) |
+| Code predictor: q/k/v and gate/up as one concatenated quantized matmul each (−3 kernels per layer) | 14.35 → 14.49–14.55 ms/frame (`cp-probe`) | not checked | rejected (not faster) |
+| Code predictor: merge attention heads by reshape when T = 1 | 14.39 → 14.39–14.41 ms/frame | identical | rejected (no change; MLX already avoids the copy) |
 
 ## 8-bit vs bf16 on the speaker path (user decision: 8-bit ships; evidence)
 
