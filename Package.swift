@@ -11,7 +11,9 @@ let package = Package(
         .executable(name: "voice-bench", targets: ["VoiceBench"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.6"),
+        // A range, not exact: dollcore embeds this package next to mlx-swift-lm, which needs
+        // mlx-swift 0.32.x. Standalone builds stay on the resolved 0.31.6 (Package.resolved).
+        .package(url: "https://github.com/ml-explore/mlx-swift", "0.31.6"..<"0.33.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.4.0"),
     ],
     targets: [
