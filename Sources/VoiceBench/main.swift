@@ -13,6 +13,10 @@ let usage = """
       bench       Synthesize a lines file; per-line latency, time-to-first-audio,
                   mean/median/max, per-stage profile, peak memory, optional SIM-o.
       parity      Compare against dumps from scripts/qwen_parity.py.
+      stream-parity  Streamed (stateful decoder) vs non-streamed audio of the same tokens:
+                  SNR first 1 s / rest vs whole decode, tokens equal (--seeds, --indices,
+                  --seed-frames-list 72,150 for tail seeding, --out DIR for streamed WAVs).
+      cp-probe    Code predictor per-frame time vs overhead floor and weight-traffic floor.
       sim-parity  Swift scorer vs Python scores (scripts/sim_parity.py).
       matmul-check  fp32 matmul precision probe (env MM_M/MM_K/MM_N).
 
@@ -36,7 +40,7 @@ let usage = """
     synth:  --text TEXT --lang L --out FILE.wav [--stream]
     bench:  --lines PATH (JSON [[text, lang, tag?], ...]; default lines20.json)
             [--indices 0,3,5] --out DIR --warmup N (default 1) --profile
-            --stream [--first-chunk N --chunk N --left-context N]
+            --stream [--first-chunk N --chunk N --seed-frames N]
             --score [--sim-weights F --sim-anchor WAV]
     parity: --dump DIR (from scripts/qwen_parity.py)
     """
@@ -123,7 +127,10 @@ func streamingOptions(_ a: inout Args) throws -> StreamingOptions {
     var s = StreamingOptions()
     s.firstChunkFrames = try a.int("first-chunk", s.firstChunkFrames)
     s.chunkFrames = try a.int("chunk", s.chunkFrames)
-    s.leftContextFrames = try a.int("left-context", s.leftContextFrames)
+    if let n = a.optional("seed-frames") {
+        guard let v = Int(n) else { throw BenchError.usage("--seed-frames expects an integer") }
+        s.referenceSeedFrames = v
+    }
     return s
 }
 
@@ -200,7 +207,11 @@ func runBench(_ argv: ArraySlice<String>) async throws {
     for _ in 0 ..< warmup {
         var w = o
         w.seed = 12345
-        _ = try synthesize(tts, "Warm up.", "en", voice, w, stream: stream)
+        let r = try synthesize(tts, "Warm up.", "en", voice, w, stream: stream)
+        if r.synthesis.timings.decoderSeed > 0.01 {
+            print(String(format: "warm-up: streaming decoder seeded from the reference in %.3fs (once per reference)",
+                         r.synthesis.timings.decoderSeed))
+        }
     }
     var lat: [Double] = [], ttfa: [Double] = [], audioSec: [Double] = []
     var prefill: [Double] = [], talkerStep: [Double] = [], cpFrame: [Double] = [], decode: [Double] = []
@@ -387,6 +398,94 @@ func runParity(_ argv: ArraySlice<String>) async throws {
                  exactLines, lines.count, Double(tokMatch) / Double(max(tokTotal, 1)), tokMatch, tokTotal))
 }
 
+// MARK: - stream-parity
+
+/// Streamed (stateful decoder) vs non-streamed output of the same tokens.
+func runStreamParity(_ argv: ArraySlice<String>) async throws {
+    var a = try Args(argv, flags: ["greedy"])
+    let tts = try await loadModel(&a)
+    let (voice, _) = try loadVoice(tts, &a)
+    var o = try generationOptions(&a)
+    var stream = try streamingOptions(&a)
+    let linesPath = try a.string("lines", "/tmp/omnivoice/lines20.json")
+    let indices = a.optional("indices").map { $0.split(separator: ",").map { Int($0)! } }
+    let seeds = try a.string("seeds", "0").split(separator: ",").map { UInt64($0)! }
+    let variants: [Int?] = [stream.referenceSeedFrames]
+        + (a.optional("seed-frames-list")?.split(separator: ",").map { Int($0)! } ?? [])
+    let outDir = a.optional("out")
+    try a.checkAllConsumed()
+    guard case .reference(let ref) = voice else { throw BenchError.usage("stream-parity needs an ICL reference") }
+    let raw = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: linesPath)))
+    guard var lines = raw as? [[String]] else { throw BenchError.failed("\(linesPath): bad lines file") }
+    if let indices { lines = indices.map { lines[$0] } }
+    if let outDir { try FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true) }
+
+    let sr = 24000
+    var tokenMismatch = 0
+    // Per variant: SNR (dB) of the first second / the rest vs whole decode; vs `generate`.
+    var head = [[Double]](repeating: [], count: variants.count)
+    var tail = [[Double]](repeating: [], count: variants.count)
+    var vsGenerate = [[Double]](repeating: [], count: variants.count)
+    for seed in seeds {
+        o.seed = seed
+        for (i, line) in lines.enumerated() {
+            let g = try tts.generate(text: line[0], language: line[1], voice: voice, options: o)
+            let total = ref.frames + g.frames
+            let full = tts.decode(codes: ref.codes + g.codes, frames: total, chunkFrames: total, leftContextFrames: 0)
+            let whole = Array(full[(ref.frames * 1920)...])
+            let name = "s\(seed)_\(line.count > 2 ? line[2] : String(format: "%02d", i))"
+            var report = String(format: "[%@] frames %d (ref+target %d)", name, g.frames, total)
+            for (v, frames) in variants.enumerated() {
+                stream.referenceSeedFrames = frames
+                var samples: [Float] = []
+                let s = try tts.generateStreaming(
+                    text: line[0], language: line[1], voice: voice, options: o, streaming: stream
+                ) { samples += $0.samples }
+                if s.codes != g.codes || samples.count != whole.count { tokenMismatch += 1 }
+                let h = min(sr, whole.count)
+                let sh = compareSignals(Array(whole[..<h]), Array(samples[..<h])).snrDB
+                let st = h < whole.count ? compareSignals(Array(whole[h...]), Array(samples[h...])).snrDB : Double.nan
+                let sg = compareSignals(g.samples, samples).snrDB
+                head[v].append(sh)
+                if !st.isNaN { tail[v].append(st) }
+                vsGenerate[v].append(sg)
+                report += String(format: " | seed %@: tokens %@, vs whole %.1f / %.1f dB, vs generate %.1f dB",
+                                 frames.map { "\($0)" } ?? "all", s.codes == g.codes ? "same" : "DIFFER", sh, st, sg)
+                if v == 0, let outDir {
+                    try AudioIO.writeWAV(samples, sampleRate: sr,
+                                         to: URL(fileURLWithPath: outDir).appendingPathComponent("\(name).wav"))
+                }
+            }
+            print(report)
+        }
+    }
+    for (v, frames) in variants.enumerated() {
+        let h = Stats(head[v]), t = Stats(tail[v]), g = Stats(vsGenerate[v])
+        print(String(format: "seed %@: SNR vs whole decode, first 1 s: mean %.1f min %.1f dB; rest: mean %.1f min %.1f dB "
+                     + "(n=%d); vs generate: mean %.1f min %.1f dB", frames.map { "\($0) frames" } ?? "whole reference",
+                     h.mean, h.min, t.mean, t.min, tail[v].count, g.mean, g.min))
+    }
+    print("streamed tokens/lengths differing from generate: \(tokenMismatch)")
+    if tokenMismatch > 0 { throw BenchError.failed("streamed tokens differ from generate") }
+}
+
+// MARK: - cp-probe
+
+func runCPProbe(_ argv: ArraySlice<String>) async throws {
+    var a = try Args(argv, flags: ["greedy"])
+    let tts = try await loadModel(&a)
+    let o = try generationOptions(&a)
+    let frames = try a.int("frames", 200)
+    try a.checkAllConsumed()
+    let p = tts.probeCodePredictor(frames: frames, sampling: o.sampling)
+    print(String(format: "code predictor per frame: %.2f ms (eval per frame), %.2f ms (queued)", p.frameMs, p.frameQueuedMs))
+    print(String(format: "same graph, hidden 64 (overhead floor): %.2f ms", p.tinyFrameMs))
+    print(String(format: "weights read per frame %.0f MB; 8-bit qmv bandwidth %.0f GB/s -> weight floor %.2f ms",
+                 p.weightBytesPerFrame / 1e6, p.qmvBandwidthGBs, p.weightFloorMs))
+    print(String(format: "talker step reads %.0f MB -> %.2f ms; talker + code predictor floor %.2f ms/frame",
+                 p.talkerWeightBytesPerFrame / 1e6, p.talkerWeightFloorMs, p.talkerWeightFloorMs + p.weightFloorMs))
+}
+
 /// Relative error of MLX fp32 matmul (GPU and CPU streams) against Float64.
 func runMatmulCheck() {
     let env = ProcessInfo.processInfo.environment
@@ -427,6 +526,8 @@ do {
     case "bench": try await runBench(argv.dropFirst(2))
     case "synth": try await runSynth(argv.dropFirst(2))
     case "parity": try await runParity(argv.dropFirst(2))
+    case "stream-parity": try await runStreamParity(argv.dropFirst(2))
+    case "cp-probe": try await runCPProbe(argv.dropFirst(2))
     case "matmul-check": runMatmulCheck()
     case "sim-parity": try runSimParity(argv.dropFirst(2))
     case "-h", "--help", "help": print(usage)

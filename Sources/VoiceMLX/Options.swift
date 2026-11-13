@@ -79,9 +79,12 @@ public struct StreamingOptions: Sendable {
     public var firstChunkFrames = 4
     /// Frames per later chunk.
     public var chunkFrames = 12
-    /// Previously generated (or reference) frames re-decoded as left context per chunk.
-    /// 72 = the decoder's sliding window; 25 gave audible artifacts (README, streaming).
-    public var leftContextFrames = 72
+    /// ICL: the stateful codec decoder is seeded by decoding the last
+    /// `referenceSeedFrames` reference frames once per reference (cached), so chunk 1
+    /// continues the reference like the non-streamed decode (reference + target, cut).
+    /// `nil` = the whole reference (default; matches a whole-sequence decode to float
+    /// rounding, README "Streaming").
+    public var referenceSeedFrames: Int?
 
     public init() {}
 }

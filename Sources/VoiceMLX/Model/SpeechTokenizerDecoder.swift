@@ -3,12 +3,46 @@ import MLX
 import MLXNN
 import MLXFast
 
+// MARK: - Streaming state
+
+/// State carried between chunks of a stateful streaming decode (`decodeStep`): for every
+/// transformer layer the last `slidingWindow - 1` RoPE'd keys and values, for every causal
+/// convolution the input tail it reads across a chunk boundary, and the absolute frame
+/// position. Every stage of the decoder is causal, so decoding a sequence chunk by chunk
+/// with this state equals decoding it whole (up to float rounding).
+public struct CodecDecoderState {
+    /// State tensors in module traversal order (see `SpeechTokenizerDecoder.freshState`).
+    var tensors: [MLXArray]
+    /// Frames decoded so far (the RoPE position of the next frame).
+    public internal(set) var frames: Int
+}
+
+/// Threads the state tensors through one stateful forward pass in module order.
+final class StreamCursor {
+    private let input: [MLXArray]
+    private var index = 0
+    private(set) var output: [MLXArray] = []
+
+    init(_ input: [MLXArray]) { self.input = input }
+
+    func take() -> MLXArray {
+        defer { index += 1 }
+        return input[index]
+    }
+
+    func put(_ x: MLXArray) { output.append(x) }
+
+    var consumedAll: Bool { index == input.count && output.count == input.count }
+}
+
 // MARK: - Causal Conv1d
 
 /// Conv1d with left padding for causality
 public class CausalConv1d: Module {
     @ModuleInfo var conv: Conv1d
     let padAmount: Int
+    let inputChannels: Int
+    let stride: Int
 
     public init(
         inputChannels: Int,
@@ -21,6 +55,8 @@ public class CausalConv1d: Module {
     ) {
         // For causal: pad = (kernel_size - 1) * dilation on the left only
         self.padAmount = (kernelSize - 1) * dilation
+        self.inputChannels = inputChannels
+        self.stride = stride
         self._conv.wrappedValue = Conv1d(
             inputChannels: inputChannels,
             outputChannels: outputChannels,
@@ -42,6 +78,20 @@ public class CausalConv1d: Module {
             : x
         return conv(padded)
     }
+
+    /// Zero history (equals the left padding of a whole-sequence decode).
+    func appendFreshState(to s: inout [MLXArray]) {
+        if padAmount > 0 { s.append(MLXArray.zeros([1, padAmount, inputChannels])) }
+    }
+
+    /// Streaming forward: the carried `padAmount` input samples replace the zero padding.
+    func step(_ x: MLXArray, _ s: StreamCursor) -> MLXArray {
+        guard padAmount > 0 else { return conv(x) }
+        precondition(stride == 1, "stateful CausalConv1d supports stride 1 only")
+        let full = concatenated([s.take(), x], axis: 1)
+        s.put(full[0..., (full.dim(1) - padAmount)..., 0...])
+        return conv(full)
+    }
 }
 
 // MARK: - Causal Transposed Conv1d
@@ -50,6 +100,10 @@ public class CausalConv1d: Module {
 public class CausalTransposeConv1d: Module {
     @ModuleInfo var conv: ConvTransposed1d
     let trimRight: Int
+    let inputChannels: Int
+    let stride: Int
+    /// Input frames whose kernel footprint overlaps the next frame's outputs.
+    let historyFrames: Int
 
     public init(
         inputChannels: Int,
@@ -58,8 +112,12 @@ public class CausalTransposeConv1d: Module {
         stride: Int = 1,
         bias: Bool = true
     ) {
-        // trim = kernel_size - stride
+        precondition(kernelSize >= stride && (kernelSize - stride) % stride == 0,
+                     "kernel must be a multiple of the stride")
         self.trimRight = kernelSize - stride
+        self.inputChannels = inputChannels
+        self.stride = stride
+        self.historyFrames = (kernelSize - stride) / stride
         self._conv.wrappedValue = ConvTransposed1d(
             inputChannels: inputChannels,
             outputChannels: outputChannels,
@@ -80,6 +138,21 @@ public class CausalTransposeConv1d: Module {
             out = out[0..., 0..<(outLen - trimRight), 0...]
         }
         return out
+    }
+
+    func appendFreshState(to s: inout [MLXArray]) {
+        if historyFrames > 0 { s.append(MLXArray.zeros([1, historyFrames, inputChannels])) }
+    }
+
+    /// Streaming forward: prepend the carried input frames and keep the outputs of the new
+    /// frames only (`[h·stride, (h+n)·stride)`), which equal the whole-sequence outputs.
+    func step(_ x: MLXArray, _ s: StreamCursor) -> MLXArray {
+        let h = historyFrames
+        guard h > 0 else { return callAsFunction(x) }
+        let n = x.dim(1)
+        let full = concatenated([s.take(), x], axis: 1)
+        s.put(full[0..., (full.dim(1) - h)..., 0...])
+        return conv(full)[0..., (h * stride) ..< ((h + n) * stride), 0...]
     }
 }
 
@@ -167,6 +240,18 @@ public class ConvNeXtBlock: Module {
         h = layerScale(h)
         return h + residual
     }
+
+    func appendFreshState(to s: inout [MLXArray]) { dwConv.appendFreshState(to: &s) }
+
+    func step(_ x: MLXArray, _ s: StreamCursor) -> MLXArray {
+        var h = dwConv.step(x, s)
+        h = norm(h)
+        h = pwConv1(h)
+        h = gelu(h)
+        h = pwConv2(h)
+        h = layerScale(h)
+        return h + x
+    }
 }
 
 // MARK: - Decoder Residual Unit
@@ -199,6 +284,19 @@ public class DecoderResidualUnit: Module {
         h = conv2(h)
         return h + residual
     }
+
+    func appendFreshState(to s: inout [MLXArray]) {
+        conv1.appendFreshState(to: &s)
+        conv2.appendFreshState(to: &s)
+    }
+
+    func step(_ x: MLXArray, _ s: StreamCursor) -> MLXArray {
+        var h = snake1(x)
+        h = conv1.step(h, s)
+        h = snake2(h)
+        h = conv2.step(h, s)
+        return h + x
+    }
 }
 
 // MARK: - Decoder Block (Upsample)
@@ -228,6 +326,17 @@ public class DecoderBlock: Module {
         for unit in residualUnits {
             h = unit(h)
         }
+        return h
+    }
+
+    func appendFreshState(to s: inout [MLXArray]) {
+        upsample.appendFreshState(to: &s)
+        for unit in residualUnits { unit.appendFreshState(to: &s) }
+    }
+
+    func step(_ x: MLXArray, _ s: StreamCursor) -> MLXArray {
+        var h = upsample.step(snake(x), s)
+        for unit in residualUnits { h = unit.step(h, s) }
         return h
     }
 }
@@ -263,10 +372,14 @@ public class DecoderTransformerAttention: Module {
         super.init()
     }
 
+    /// `cache`: keys (after RoPE) and values of earlier positions, prepended to this call's.
+    /// `position`: absolute position of `x[0]` (with a cache it is not the cache length,
+    /// which the streaming decode caps at the sliding window).
     public func callAsFunction(
         _ x: MLXArray,
         attentionMask: MLXArray? = nil,
-        cache: (MLXArray, MLXArray)? = nil
+        cache: (MLXArray, MLXArray)? = nil,
+        position: Int = 0
     ) -> (MLXArray, (MLXArray, MLXArray)) {
         let (batch, seqLen, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -274,9 +387,8 @@ public class DecoderTransformerAttention: Module {
         var k = kProj(x).reshaped(batch, seqLen, numHeads, headDim).transposed(0, 2, 1, 3)
         let v = vProj(x).reshaped(batch, seqLen, numHeads, headDim).transposed(0, 2, 1, 3)
 
-        let offset = cache?.0.dim(2) ?? 0
-        q = rope(q, offset: offset)
-        k = rope(k, offset: offset)
+        q = rope(q, offset: position)
+        k = rope(k, offset: position)
 
         var cachedK = k
         var cachedV = v
@@ -331,11 +443,12 @@ public class DecoderTransformerLayer: Module {
     public func callAsFunction(
         _ x: MLXArray,
         attentionMask: MLXArray? = nil,
-        cache: (MLXArray, MLXArray)? = nil
+        cache: (MLXArray, MLXArray)? = nil,
+        position: Int = 0
     ) -> (MLXArray, (MLXArray, MLXArray)) {
         let residual = x
         var h = norm1(x)
-        let (attnOut, newCache) = selfAttn(h, attentionMask: attentionMask, cache: cache)
+        let (attnOut, newCache) = selfAttn(h, attentionMask: attentionMask, cache: cache, position: position)
         h = residual + attnLayerScale(attnOut)
 
         let residual2 = h
@@ -396,6 +509,45 @@ public class DecoderTransformer: Module {
         h = norm(h)
         h = outputProj(h)  // [B, T, 512] -> [B, T, 1024]
         return h
+    }
+}
+
+extension DecoderTransformer {
+    func appendFreshState(to s: inout [MLXArray], numHeads: Int, headDim: Int) {
+        for _ in layers {
+            s.append(MLXArray.zeros([1, numHeads, 0, headDim]))
+            s.append(MLXArray.zeros([1, numHeads, 0, headDim]))
+        }
+    }
+
+    /// Streaming forward of `n` new frames at absolute `position`. Each layer's carried
+    /// keys/values (at most `slidingWindow - 1`, the most any later query can see) are
+    /// prepended; the mask is the whole-sequence sliding-window mask restricted to the
+    /// new rows.
+    func step(_ x: MLXArray, position: Int, _ s: StreamCursor) -> MLXArray {
+        var h = inputProj(x)
+        let n = h.dim(1)
+        var mask: MLXArray?
+        for layer in layers {
+            let prevK = s.take(), prevV = s.take()
+            let c = prevK.dim(2)
+            if mask == nil && (n > 1 || c + n > slidingWindow) {
+                // Row i is absolute position c + i over keys 0 ..< c + n (relative to the cache start).
+                let rows = (MLXArray(0..<Int32(n)) + Int32(c)).expandedDimensions(axis: 1)
+                let cols = MLXArray(0..<Int32(c + n)).expandedDimensions(axis: 0)
+                let blocked = logicalOr(cols .> rows, (rows - cols) .>= Int32(slidingWindow))
+                mask = MLX.where(blocked, MLXArray(-Float.infinity), MLXArray(Float(0)))
+                    .expandedDimensions(axes: [0, 1])
+                    .asType(h.dtype)
+            }
+            let (out, (k, v)) = layer(h, attentionMask: mask, cache: (prevK, prevV), position: position)
+            let keep = min(slidingWindow - 1, k.dim(2))
+            s.put(k[0..., 0..., (k.dim(2) - keep)..., 0...])
+            s.put(v[0..., 0..., (v.dim(2) - keep)..., 0...])
+            h = out
+        }
+        h = norm(h)
+        return outputProj(h)
     }
 }
 
@@ -571,10 +723,6 @@ public class SpeechTokenizerDecoder: Module {
     @ModuleInfo var finalSnake: SnakeBeta
     @ModuleInfo var finalConv: CausalConv1d
 
-    /// Compiled decoder forward pass for kernel fusion. Uses shapeless=false since
-    /// most chunks have a fixed size [1, 16, 35]. Different sizes retrace automatically.
-    private var compiledDecoder: (([MLXArray]) -> [MLXArray])?
-
     public init(config: SpeechTokenizerDecoderConfig) {
         self.config = config
 
@@ -627,40 +775,46 @@ public class SpeechTokenizerDecoder: Module {
         super.init()
     }
 
-    /// Set up compiled decoder forward pass for Metal kernel fusion.
-    ///
-    /// With shapeless=false, the compiled graph is traced once per input shape
-    /// and cached. Most decode chunks share the shape [1, 16, 35], so the graph
-    /// is reused across chunks. Different sizes (e.g., last chunk) retrace once.
-    public func setupCompilation() {
-        let selfRef = self
+    // MARK: Stateful streaming decode
 
-        compiledDecoder = compile(
-            inputs: [selfRef], outputs: [selfRef], shapeless: false
-        ) { inputs in
-            let codes = inputs[0]
-            let waveform = selfRef.callAsFunction(codes)
-            return [waveform]
-        }
+    /// State before any frame: zero conv history and empty attention caches, so the first
+    /// `decodeStep` equals the start of a whole-sequence decode.
+    public func freshState() -> CodecDecoderState {
+        var s: [MLXArray] = []
+        preConv.appendFreshState(to: &s)
+        transformer.appendFreshState(to: &s, numHeads: config.numHeads, headDim: config.headDim)
+        preUpsample1.appendFreshState(to: &s)
+        preConvNeXt1.appendFreshState(to: &s)
+        preUpsample2.appendFreshState(to: &s)
+        preConvNeXt2.appendFreshState(to: &s)
+        inputConv.appendFreshState(to: &s)
+        for block in decoderBlocks { block.appendFreshState(to: &s) }
+        finalConv.appendFreshState(to: &s)
+        return CodecDecoderState(tensors: s, frames: 0)
     }
 
-    /// Execute decoder (compiled when available, falls back to uncompiled).
-    public func executeDecoder(_ codes: MLXArray) -> MLXArray {
-        if let compiled = compiledDecoder {
-            return compiled([codes])[0]
-        }
-        return callAsFunction(codes)
-    }
-
-    /// Warm up the compiled decoder with a dummy forward pass.
-    /// Pre-traces the graph for the common chunk shape [1, 16, 35] and
-    /// compiles Metal shaders so subsequent decodes pay zero compilation cost.
-    public func warmUp() {
-        guard compiledDecoder != nil else { return }
-
-        let dummyCodes = MLXArray.zeros([1, 16, 35]).asType(.int32)
-        let result = executeDecoder(dummyCodes)
-        eval(result)
+    /// Decode the next `n` frames (`codes`: `[1, 16, n]`) after the frames already folded
+    /// into `state`; returns their `[1, n * 1920, 1]` samples and advances `state`.
+    /// Concatenating the outputs of consecutive calls from `freshState()` equals
+    /// `callAsFunction` on the concatenated codes, up to float rounding. (Not wrapped in
+    /// `compile`: measured no faster, README optimization log.)
+    public func decodeStep(_ codes: MLXArray, state: inout CodecDecoderState) -> MLXArray {
+        precondition(codes.dim(0) == 1 && codes.dim(2) > 0)
+        let s = StreamCursor(state.tensors)
+        var h = splitRVQ.decode(codes)
+        h = preConv.step(h, s)
+        h = transformer.step(h, position: state.frames, s)
+        h = preUpsample1.step(h, s)
+        h = preConvNeXt1.step(h, s)
+        h = preUpsample2.step(h, s)
+        h = preConvNeXt2.step(h, s)
+        h = inputConv.step(h, s)
+        for block in decoderBlocks { h = block.step(h, s) }
+        h = finalConv.step(finalSnake(h), s)
+        precondition(s.consumedAll, "stream state layout differs from freshState()")
+        state.tensors = s.output
+        state.frames += codes.dim(2)
+        return clip(h, min: -1.0, max: 1.0)
     }
 
     /// Decode codebook indices to audio waveform
@@ -707,7 +861,7 @@ public class SpeechTokenizerDecoder: Module {
         while start < numFrames {
             let end = min(start + chunkSize, numFrames)
             let context = min(leftContext, start)
-            let wav = executeDecoder(codes[0..., 0..., (start - context) ..< end])
+            let wav = callAsFunction(codes[0..., 0..., (start - context) ..< end])
             let kept = wav[0..., (context * samplesPerFrame)..., 0...]
             // Evaluate per chunk so the 480x-upsampled intermediates are freed.
             eval(kept)

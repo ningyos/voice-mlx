@@ -218,6 +218,13 @@ extension Qwen3Voice {
             refCodes = ref.codes
             refFrames = ref.frames
         }
+        // Streaming: decoder state continuing the reference (seeded once per reference).
+        var decoderState: CodecDecoderState?
+        if let streaming, onChunk != nil {
+            let t0 = now()
+            decoderState = try streamingDecoderState(refCodes: refCodes, refFrames: refFrames, streaming: streaming)
+            timings.decoderSeed = now() - t0
+        }
 
         // Prefill
         let L = prompt.prefill.dim(1)
@@ -248,26 +255,18 @@ extension Qwen3Voice {
         }
 
         func emit(upTo end: Int, final: Bool) throws {
-            guard let onChunk, let streaming else { return }
+            guard let onChunk, decoderState != nil else { return }
             if end == emittedFrames {
                 // Nothing new (all frames already streamed): close with an empty final chunk.
                 try onChunk(AudioChunk(samples: [], frames: end ..< end, isFinal: final, elapsed: now() - start))
                 return
             }
             let t0 = now()
-            syncCodes(upTo: end)
             let startF = emittedFrames
-            // Left context from earlier generated frames, then reference frames.
-            let ctx = min(streaming.leftContextFrames, startF + refFrames)
-            let fromRef = max(0, ctx - startF)
-            var ctxCodes: [Int32] = []
-            if fromRef > 0 { ctxCodes += refCodes[((refFrames - fromRef) * 16)...] }
-            ctxCodes += codes[((startF - (ctx - fromRef)) * 16) ..< (end * 16)]
-            let n = ctx + (end - startF)
-            let arr = MLXArray(ctxCodes, [n, 16]).transposed(1, 0).expandedDimensions(axis: 0)
-            let wav = decoder.executeDecoder(arr).reshaped(-1)
-            let kept = wav[(ctx * codecConfig.samplesPerFrame)...]
-            let samples = kept.asArray(Float.self)
+            // Only the new frames: earlier frames are folded into the decoder state.
+            let arr = stacked(Array(frameCodes[startF ..< end]), axis: 1).expandedDimensions(axis: 0)
+            let wav = decoder.decodeStep(arr, state: &decoderState!)
+            let samples = wav.reshaped(-1).asArray(Float.self)
             timings.decode += now() - t0
             emittedFrames = end
             try onChunk(AudioChunk(samples: samples, frames: startF ..< end, isFinal: final, elapsed: now() - start))
@@ -327,7 +326,8 @@ extension Qwen3Voice {
             code0 = next
         }
         syncCodes(upTo: frames)
-        if !profile { timings.talker = now() - tStep }
+        // Streaming: chunk decodes inside the loop are reported under `decode`, not `talker`.
+        if !profile { timings.talker = now() - tStep - timings.decode }
 
         if streaming != nil, onChunk != nil {
             try emit(upTo: frames, final: true)
@@ -352,6 +352,41 @@ extension Qwen3Voice {
         timings.total = now() - start
         return Synthesis(samples: samples, codes: codes, frames: frames, seed: seed, finished: finished, timings: timings)
     }
+
+    /// Decoder state for a streamed utterance: fresh for the speaker path; for ICL the
+    /// state after decoding the (last `referenceSeedFrames`) reference frames, computed once
+    /// per reference and seed length and cached.
+    func streamingDecoderState(refCodes: [Int32], refFrames: Int, streaming: StreamingOptions) throws
+        -> CodecDecoderState
+    {
+        if let n = streaming.referenceSeedFrames, n < 1 {
+            throw VoiceError.invalidArgument("referenceSeedFrames must be >= 1")
+        }
+        if streaming.firstChunkFrames < 1 || streaming.chunkFrames < 1 {
+            throw VoiceError.invalidArgument("firstChunkFrames and chunkFrames must be >= 1")
+        }
+        let n = min(refFrames, streaming.referenceSeedFrames ?? refFrames)
+        if n == 0 { return decoder.freshState() }
+        let seedCodes = Array(refCodes[((refFrames - n) * 16)...])
+        if let cached = decoderSeed, cached.codes == seedCodes { return cached.state }
+        var state = decoder.freshState()
+        var at = 0
+        while at < n {
+            // Chunked only to bound the upsampler's working set; the state is chunk-invariant.
+            let end = min(at + Self.seedChunkFrames, n)
+            let arr = MLXArray(Array(seedCodes[(at * 16) ..< (end * 16)]), [end - at, 16])
+                .transposed(1, 0).expandedDimensions(axis: 0)
+            _ = decoder.decodeStep(arr, state: &state)
+            eval(state.tensors)
+            at = end
+        }
+        decoderSeed = (seedCodes, state)
+        return state
+    }
+
+    /// Seeding chunk (frames): bounds the upsampler's working set to that of a default
+    /// streaming chunk (60 frames: 4.8 GB process peak instead of 3.0 GB, measured).
+    static let seedChunkFrames = 12
 }
 
 @inline(__always) func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e9 }

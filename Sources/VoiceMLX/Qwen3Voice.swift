@@ -31,9 +31,13 @@ public enum Voice: Sendable {
 }
 
 public struct StageTimings: Sendable {
+    /// Streaming: building the decoder state from the reference (first use of a reference
+    /// only, else ~0; included in `prefill`).
+    public var decoderSeed: Double = 0
     /// Prompt construction + talker prefill + first token.
     public var prefill: Double = 0
-    /// Talker steps after the first token (forward + sampling).
+    /// Talker steps after the first token (forward + sampling + code predictor; streaming
+    /// chunk decodes excluded, they are in `decode`).
     public var talker: Double = 0
     /// Code predictor (codebooks 1–15) over all frames.
     public var codePredictor: Double = 0
@@ -89,6 +93,8 @@ public final class Qwen3Voice: @unchecked Sendable {
 
     var compiledTalkerStep: (([MLXArray]) -> [MLXArray])?
     var compiledFrames: [String: ([MLXArray]) -> [MLXArray]] = [:]
+    /// Streaming decoder state after the reference codes it was seeded with (last reference only).
+    var decoderSeed: (codes: [Int32], state: CodecDecoderState)?
     var suppressMask: MLXArray
 
     // MARK: Loading
@@ -273,9 +279,12 @@ public final class Qwen3Voice: @unchecked Sendable {
         try run(text: text, language: language, voice: voice, options: options, streaming: nil, onChunk: nil)
     }
 
-    /// Streaming variant: `onChunk` receives audio as codec frames are produced. The
-    /// concatenation of all chunks is the utterance (chunk boundaries are decoded with
-    /// `leftContextFrames` of left context, so it differs slightly from `generate`).
+    /// Streaming variant: `onChunk` receives audio as codec frames are produced. Chunks are
+    /// decoded by a stateful codec decoder that continues the reference (ICL; seeded once per
+    /// reference), so the concatenation of all chunks equals a whole-sequence decode of
+    /// reference + generated codes, cut at the reference (up to float rounding). `generate`
+    /// instead follows the reference's 300-frame chunked decode, so beyond 300 frames of
+    /// reference + target the two differ (README, streaming).
     @discardableResult
     public func generateStreaming(
         text: String, language: String, voice: Voice, options: GenerationOptions,

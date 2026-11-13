@@ -168,8 +168,78 @@ final class GenerationTests: XCTestCase {
         XCTAssertTrue(chunks.last!.isFinal)
         XCTAssertEqual(chunks.map(\.samples.count).reduce(0, +), s.frames * 1920)
         XCTAssertEqual(chunks.last!.frames.upperBound, s.frames)
-        // Same seed without streaming yields the same tokens.
+        // Same seed without streaming yields the same tokens, and (reference + target is
+        // under the reference's 300-frame decode chunk) the same audio up to float rounding.
         let full = try m.generate(text: "你今天吃飯了沒？", language: "zh", voice: .reference(r), options: o)
         XCTAssertEqual(full.codes, s.codes)
+        XCTAssertGreaterThan(snrDB(full.samples, chunks.flatMap(\.samples)), 30)
+    }
+}
+
+/// SNR of `x` against `ref` in dB.
+private func snrDB(_ ref: [Float], _ x: [Float]) -> Double {
+    precondition(ref.count == x.count)
+    var sig = 0.0, err = 0.0
+    for (a, b) in zip(ref, x) {
+        sig += Double(a) * Double(a)
+        err += Double(a - b) * Double(a - b)
+    }
+    return 10 * log10(sig / max(err, 1e-30))
+}
+
+final class CodecDecoderStreamingTests: XCTestCase {
+    /// A small randomly initialised decoder (deterministic): window 8 so the attention
+    /// caches evict within a short fixture; every conv / transposed-conv shape kind is kept.
+    private func smallDecoder() -> SpeechTokenizerDecoder {
+        var c = SpeechTokenizerDecoderConfig()
+        c.latentDim = 32
+        c.decoderDim = 64
+        c.hiddenSize = 32
+        c.numHeads = 4
+        c.numKVHeads = 4
+        c.headDim = 8
+        c.numLayers = 2
+        c.upsampleRates = [4, 3]
+        c.semanticCodebookSize = 64
+        c.acousticCodebookSize = 64
+        c.codebookDim = 16
+        c.slidingWindow = 8
+        MLXRandom.seed(0)
+        let d = SpeechTokenizerDecoder(config: c)
+        eval(d)
+        return d
+    }
+
+    func testChunkedStatefulDecodeEqualsWholeDecode() {
+        let d = smallDecoder()
+        let frames = 41
+        let codes = MLXRandom.randInt(0 ..< 64, [1, 16, frames], key: MLXRandom.key(1)).asType(.int32)
+        let whole = d(codes).reshaped(-1).asArray(Float.self)
+        // Uneven chunks, incl. single frames and chunks longer than the window.
+        var state = d.freshState()
+        var streamed: [Float] = []
+        var at = 0
+        for n in [1, 4, 12, 1, 9, 3, 11] {
+            let end = min(at + n, frames)
+            streamed += d.decodeStep(codes[0..., 0..., at ..< end], state: &state).reshaped(-1).asArray(Float.self)
+            at = end
+        }
+        XCTAssertEqual(at, frames)
+        XCTAssertEqual(state.frames, frames)
+        XCTAssertEqual(streamed.count, whole.count)
+        XCTAssertGreaterThan(snrDB(whole, streamed), 90)
+    }
+
+    func testStateIsChunkingInvariant() {
+        // A state built in one chunk continues exactly like one built frame by frame.
+        let d = smallDecoder()
+        let codes = MLXRandom.randInt(0 ..< 64, [1, 16, 30], key: MLXRandom.key(2)).asType(.int32)
+        var a = d.freshState()
+        _ = d.decodeStep(codes[0..., 0..., 0 ..< 20], state: &a)
+        var b = d.freshState()
+        for i in 0 ..< 20 { _ = d.decodeStep(codes[0..., 0..., i ..< (i + 1)], state: &b) }
+        let tailA = d.decodeStep(codes[0..., 0..., 20...], state: &a).reshaped(-1).asArray(Float.self)
+        let tailB = d.decodeStep(codes[0..., 0..., 20...], state: &b).reshaped(-1).asArray(Float.self)
+        XCTAssertGreaterThan(snrDB(tailA, tailB), 90)
     }
 }
