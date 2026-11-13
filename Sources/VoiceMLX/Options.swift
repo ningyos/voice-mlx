@@ -80,7 +80,8 @@ public struct StreamingOptions: Sendable {
     /// Frames per later chunk.
     public var chunkFrames = 12
     /// Previously generated (or reference) frames re-decoded as left context per chunk.
-    public var leftContextFrames = 25
+    /// 72 = the decoder's sliding window; 25 gave audible artifacts (README, streaming).
+    public var leftContextFrames = 72
 
     public init() {}
 }

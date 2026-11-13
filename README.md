@@ -172,7 +172,8 @@ running, so expect ±5 % noise. Measured 2026-11-13.
 | Config | Lines | Mean | Median | Max | First audio (stream) | Peak |
 |---|---|---|---|---|---|---|
 | **Base 8-bit, ICL 19 s ref** | lines20 (14 zh, 6 en) | **1.30 s** | 1.32 s | 1.86 s | — | 7.3 GB |
-| Base 8-bit, ICL, streaming | lines20 | 1.08 s (to last chunk) | 1.00 s | 2.14 s | **0.22 s** (max 0.23) | 3.8 GB |
+| Base 8-bit, ICL, streaming, 25-frame left context (old default) | lines20 | 1.08 s (to last chunk) | 1.00 s | 2.14 s | **0.22 s** (max 0.23) | 3.8 GB |
+| **Base 8-bit, ICL, streaming, 72-frame left context (default)** | lines20 × seeds 0,1 | 1.58 s (to last chunk) | 1.42 s | 2.93 s | **0.39 s** (max 0.40) | 5.3 GB |
 | Base 8-bit, ICL (before the kept optimizations) | 8 short lines (`qw_lines` 0–7) | 1.09 s | 1.07 s | 1.19 s | — | 5.6 GB |
 | Speaker path 8-bit (voice-train smoke bundle, one speaker, `auto`) | lines20 × seeds 0,1 | 0.67 s | 0.62 s | 1.17 s | — | see note |
 | Speaker path bf16 (same bundle) | lines20 × seeds 0,1 | 1.07 s | 1.00 s | 1.85 s | — | 4.6 GB |
@@ -251,8 +252,14 @@ $PY scripts/export_sim_weights.py
 - Greedy decoding can run to `maxNewTokens` without EOS (PyTorch too); sampling is the
   default. Keep `maxNewTokens` capped (default 2048 frames ≈ 164 s); voice-train saw a
   fine-tune run away to max tokens.
-- Streaming chunks are decoded with 25 frames of left context, so the streamed waveform
-  differs slightly from `generate` (same tokens).
+- Streaming chunks are decoded with 72 frames of left context (the decoder's sliding
+  window). The old default of 25 gave audible artifacts: against the non-streamed waveform
+  of the same tokens, SNR was 9.8 dB (min −2.6) at 25 frames, 29.0 dB (min 10.0) at 72 and
+  49.4 dB (min 36.7) at 150; SIM 0.551 / 0.565 / 0.569 (non-streamed 0.570). Each chunk
+  re-decodes its context, so a longer context costs first-audio time and memory.
+- 4-bit weights were tried (quantized at load from the bf16 bundle) and dropped: no memory
+  saved (the peak is the codec decoder), SIM 0.540 vs 0.551, and one line ran to
+  `maxNewTokens` with both seeds where 8-bit stopped normally.
 - Not ported: instruct (1.7B only), x-vector-only cloning, batching, text chunking for long
   inputs, 1.7B.
 
