@@ -1,19 +1,27 @@
-omnivoice-mlx
-Copyright 2026 the omnivoice-mlx authors
+voice-mlx
+Copyright 2026 the voice-mlx authors
 
 This product includes software derived from speech-swift
 (https://github.com/soniqo/speech-swift, commit 468db5f29e1304a140e3b8d9bb9ec8f2162c13bc),
 Copyright soniqo, licensed under the Apache License, Version 2.0.
-Files under Sources/OmniVoiceMLX/ (backbone, codec encoder/decoder, input builder,
-tokenizer wrapper, rule duration estimator) started as copies of
-speech-swift Sources/OmniVoiceTTS/ and were modified.
+The Qwen3-TTS model code under Sources/VoiceMLX/ (talker, code predictor, 12 Hz
+speech-tokenizer encoder and decoder, speaker encoder, configuration and weight
+loading) started as copies of speech-swift Sources/Qwen3TTS/ and Sources/MLXCommon/
+and was modified.
 
-The model architecture, inference algorithm, text front-end, audio pre/post-processing
-and the SIM-o speaker-similarity evaluation are ports of k2-fsa OmniVoice
-(https://github.com/k2-fsa/OmniVoice, Apache License 2.0). Model weights are not part
-of this repository: the MLX bundles aufklarer/OmniVoice-MLX-int8 / -fp16 and the
-k2-fsa/TTS_eval_models speaker-similarity checkpoint (WavLM-large + ECAPA-TDNN) are
-downloaded separately and remain under their own licenses.
+Prompt layouts, sampling semantics and the text tokenizer follow QwenLM's reference
+implementation qwen-tts (https://github.com/QwenLM/Qwen3-TTS, Apache License 2.0).
 
-The torchaudio-compatible resampler reproduces torchaudio.functional.resample
-(BSD-2-Clause). The silence-removal port reproduces pydub (MIT) semantics.
+The SIM-o speaker-similarity scorer under Sources/SpeakerSim/ (WavLM-large +
+ECAPA-TDNN) and the reference-transcript text helpers in Sources/VoiceAudio/TextPrep.swift
+are ports of k2-fsa OmniVoice (https://github.com/k2-fsa/OmniVoice, Apache License 2.0;
+omnivoice/eval/speaker_similarity and omnivoice/utils/text.py).
+
+The resampler in Sources/VoiceAudio/Resampler.swift reproduces
+torchaudio.functional.resample (BSD-2-Clause). The silence removal in
+Sources/VoiceAudio/Silence.swift reproduces pydub (MIT) semantics.
+
+Model weights are not part of this repository: the MLX bundles
+aufklarer/Qwen3-TTS-12Hz-0.6B-*-MLX-*, the codec Qwen/Qwen3-TTS-Tokenizer-12Hz and
+the k2-fsa/TTS_eval_models speaker-similarity checkpoint are downloaded separately
+and remain under their own licenses.
